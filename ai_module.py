@@ -3,7 +3,10 @@ AI module for the Road Cost Estimator.
 
 This file handles:
 1. Road photo analysis using Gemini
-2. Chat Assistant using Gemini
+2. Road Project Chat Assistant using Gemini
+
+The AI only provides suggestions.
+Final engineering decisions must be made by the user/engineer.
 """
 
 import json
@@ -20,7 +23,6 @@ from google.genai import types
 
 BASE_DIR = Path(__file__).resolve().parent
 
-# Your XML files are currently in the SAME folder as ai_module.py
 PHOTO_PROMPT_PATH = BASE_DIR / "road_photo_prompt.xml"
 CHAT_PROMPT_PATH = BASE_DIR / "chat_prompt.xml"
 
@@ -36,23 +38,93 @@ MODEL = os.getenv(
 
 
 # ============================================================
-# LOAD PROMPT FILE
+# PROMPT LOADER
 # ============================================================
 
-def load_prompt(file_path):
+def load_prompt(file_path: Path) -> str:
     """
-    Read an XML prompt file.
+    Load an XML prompt file from the same folder
+    as this Python file.
     """
 
     if not file_path.exists():
-
         raise FileNotFoundError(
-            f"Prompt file not found: {file_path.name}"
+            f"Required prompt file was not found: "
+            f"{file_path.name}"
         )
 
-    return file_path.read_text(
-        encoding="utf-8"
-    )
+    try:
+        return file_path.read_text(
+            encoding="utf-8"
+        )
+
+    except Exception as error:
+        raise RuntimeError(
+            f"Could not read prompt file "
+            f"'{file_path.name}': {error}"
+        ) from error
+
+
+# ============================================================
+# GEMINI CLIENT
+# ============================================================
+
+def create_client(api_key: str):
+    """
+    Create and return a Gemini client.
+    """
+
+    if not api_key or not api_key.strip():
+        raise ValueError(
+            "Gemini API key is missing. "
+            "Please provide a valid Gemini API key."
+        )
+
+    try:
+        return genai.Client(
+            api_key=api_key.strip()
+        )
+
+    except Exception as error:
+        raise RuntimeError(
+            f"Could not create Gemini client: {error}"
+        ) from error
+
+
+# ============================================================
+# CLEAN GEMINI JSON RESPONSE
+# ============================================================
+
+def clean_json_response(text: str) -> str:
+    """
+    Clean a Gemini response before JSON parsing.
+
+    Gemini should normally return pure JSON because
+    response_mime_type is set to application/json.
+
+    This function also handles accidental markdown
+    code fences.
+    """
+
+    if not text:
+        raise ValueError(
+            "Gemini returned an empty response."
+        )
+
+    text = text.strip()
+
+    # Remove ```json ... ```
+    if text.startswith("```json"):
+        text = text[len("```json"):].strip()
+
+    # Remove ``` ... ```
+    elif text.startswith("```"):
+        text = text[len("```"):].strip()
+
+    if text.endswith("```"):
+        text = text[:-3].strip()
+
+    return text
 
 
 # ============================================================
@@ -65,26 +137,32 @@ def analyze_photo(
     api_key: str,
     note: str = ""
 ) -> dict:
-
     """
-    Send a road photo to Gemini and receive
-    structured JSON analysis.
+    Analyze a road/site photo using Gemini.
+
+    Returns a Python dictionary containing the structured
+    AI analysis defined in road_photo_prompt.xml.
     """
 
-    if not api_key:
+    # --------------------------------------------------------
+    # VALIDATE IMAGE
+    # --------------------------------------------------------
+
+    if not image_bytes:
         raise ValueError(
-            "Gemini API key is missing."
+            "No image was provided."
         )
 
+    if not mime_type:
+        mime_type = "image/jpeg"
 
     # --------------------------------------------------------
-    # CREATE GEMINI CLIENT
+    # CREATE CLIENT
     # --------------------------------------------------------
 
-    client = genai.Client(
-        api_key=api_key
+    client = create_client(
+        api_key
     )
-
 
     # --------------------------------------------------------
     # LOAD PHOTO PROMPT
@@ -94,111 +172,105 @@ def analyze_photo(
         PHOTO_PROMPT_PATH
     )
 
-
     # --------------------------------------------------------
     # USER MESSAGE
     # --------------------------------------------------------
 
     user_text = (
-        "Analyse this road photo according "
-        "to the instructions provided."
+        "Analyse this site photo according to "
+        "the instructions provided."
     )
 
-
     if note and note.strip():
-
         user_text += (
-            "\n\nEngineer's additional note: "
+            "\n\nEngineer's additional note:\n"
             + note.strip()
         )
 
-
     # --------------------------------------------------------
-    # SEND REQUEST TO GEMINI
+    # SEND PHOTO TO GEMINI
     # --------------------------------------------------------
 
-    response = client.models.generate_content(
+    try:
 
-        model=MODEL,
+        response = client.models.generate_content(
 
-        contents=[
-            types.Part.from_bytes(
-                data=image_bytes,
-                mime_type=mime_type
-            ),
-            user_text
-        ],
+            model=MODEL,
 
-        config=types.GenerateContentConfig(
+            contents=[
+                types.Part.from_bytes(
+                    data=image_bytes,
+                    mime_type=mime_type
+                ),
+                user_text
+            ],
 
-            system_instruction=system_prompt,
+            config=types.GenerateContentConfig(
 
-            response_mime_type="application/json",
+                system_instruction=system_prompt,
 
-            temperature=0.2
+                response_mime_type="application/json",
+
+                temperature=0.2
+            )
         )
+
+    except Exception as error:
+
+        raise RuntimeError(
+            f"Gemini photo analysis failed: {error}"
+        ) from error
+
+    # --------------------------------------------------------
+    # GET RESPONSE
+    # --------------------------------------------------------
+
+    response_text = getattr(
+        response,
+        "text",
+        None
     )
 
-
-    # --------------------------------------------------------
-    # GET RESPONSE TEXT
-    # --------------------------------------------------------
-
-    text = (
-        response.text or ""
-    ).strip()
-
-
-    if not text:
+    if not response_text:
 
         raise ValueError(
-            "Gemini returned an empty response."
+            "Gemini did not return any photo analysis."
         )
 
+    # --------------------------------------------------------
+    # CLEAN RESPONSE
+    # --------------------------------------------------------
+
+    cleaned_text = clean_json_response(
+        response_text
+    )
 
     # --------------------------------------------------------
-    # REMOVE MARKDOWN CODE BLOCK IF PRESENT
-    # --------------------------------------------------------
-
-    if text.startswith("```json"):
-
-        text = text[
-            len("```json"):
-        ]
-
-    elif text.startswith("```"):
-
-        text = text[
-            len("```"):
-        ]
-
-
-    if text.endswith("```"):
-
-        text = text[
-            :-len("```")
-        ]
-
-
-    text = text.strip()
-
-
-    # --------------------------------------------------------
-    # CONVERT JSON TEXT TO PYTHON DICTIONARY
+    # PARSE JSON
     # --------------------------------------------------------
 
     try:
 
         result = json.loads(
-            text
+            cleaned_text
         )
 
     except json.JSONDecodeError as error:
 
         raise ValueError(
-            "Gemini returned invalid JSON."
+            "Gemini returned an invalid JSON response. "
+            "Please try analyzing the photo again."
         ) from error
 
+    # --------------------------------------------------------
+    # BASIC VALIDATION
+    # --------------------------------------------------------
+
+    if not isinstance(result, dict):
+
+        raise ValueError(
+            "Gemini returned an unexpected response format."
+        )
 
     return result
 
@@ -214,9 +286,8 @@ def chat_reply(
     image_bytes: bytes | None = None,
     mime_type: str = "image/jpeg"
 ) -> str:
-
     """
-    Generate a response for the Road Project Chat Assistant.
+    Generate a response from the Road Project Chat Assistant.
 
     history format:
 
@@ -230,23 +301,17 @@ def chat_reply(
             "content": "..."
         }
     ]
+
+    The optional photo analysis is added as context.
     """
 
-    if not api_key:
-
-        raise ValueError(
-            "Gemini API key is missing."
-        )
-
-
     # --------------------------------------------------------
-    # CREATE GEMINI CLIENT
+    # CREATE CLIENT
     # --------------------------------------------------------
 
-    client = genai.Client(
-        api_key=api_key
+    client = create_client(
+        api_key
     )
-
 
     # --------------------------------------------------------
     # LOAD CHAT PROMPT
@@ -256,22 +321,31 @@ def chat_reply(
         CHAT_PROMPT_PATH
     )
 
-
     # --------------------------------------------------------
-    # ADD PHOTO ANALYSIS TO CHAT CONTEXT
+    # ADD PHOTO ANALYSIS
     # --------------------------------------------------------
 
     if analysis:
 
-        system_prompt += (
-            "\n\n<photo_analysis>\n"
-            + json.dumps(
+        try:
+
+            analysis_json = json.dumps(
                 analysis,
                 ensure_ascii=False
             )
+
+        except Exception:
+
+            analysis_json = str(
+                analysis
+            )
+
+        system_prompt += (
+            "\n\n"
+            "<photo_analysis>\n"
+            + analysis_json
             + "\n</photo_analysis>"
         )
-
 
     # --------------------------------------------------------
     # PREPARE CHAT HISTORY
@@ -279,8 +353,19 @@ def chat_reply(
 
     contents = []
 
+    if not history:
+
+        raise ValueError(
+            "Chat history is empty."
+        )
 
     for index, message in enumerate(history):
+
+        if not isinstance(
+            message,
+            dict
+        ):
+            continue
 
         role = message.get(
             "role",
@@ -292,29 +377,43 @@ def chat_reply(
             ""
         )
 
+        if not content:
+            continue
+
+        # ----------------------------------------------------
+        # CONVERT ROLE
+        # ----------------------------------------------------
+
+        if role == "assistant":
+            gemini_role = "model"
+
+        else:
+            gemini_role = "user"
+
+        # ----------------------------------------------------
+        # TEXT PART
+        # ----------------------------------------------------
 
         parts = [
 
             types.Part.from_text(
-                text=content
+                text=str(content)
             )
 
         ]
-
 
         # ----------------------------------------------------
         # ATTACH PHOTO TO FIRST USER MESSAGE
         # ----------------------------------------------------
 
         if (
-
             index == 0
-
             and role == "user"
-
             and image_bytes
-
         ):
+
+            if not mime_type:
+                mime_type = "image/jpeg"
 
             parts.insert(
 
@@ -330,21 +429,9 @@ def chat_reply(
 
             )
 
-
         # ----------------------------------------------------
-        # GEMINI ROLE
+        # ADD MESSAGE TO GEMINI HISTORY
         # ----------------------------------------------------
-
-        gemini_role = (
-
-            "user"
-
-            if role == "user"
-
-            else "model"
-
-        )
-
 
         contents.append(
 
@@ -358,43 +445,71 @@ def chat_reply(
 
         )
 
+    # --------------------------------------------------------
+    # CHECK HISTORY
+    # --------------------------------------------------------
+
+    if not contents:
+
+        raise ValueError(
+            "No valid messages were found in chat history."
+        )
 
     # --------------------------------------------------------
     # SEND CHAT REQUEST
     # --------------------------------------------------------
 
-    response = client.models.generate_content(
+    try:
 
-        model=MODEL,
+        response = client.models.generate_content(
 
-        contents=contents,
+            model=MODEL,
 
-        config=types.GenerateContentConfig(
+            contents=contents,
 
-            system_instruction=system_prompt,
+            config=types.GenerateContentConfig(
 
-            temperature=0.5
+                system_instruction=system_prompt,
+
+                temperature=0.5
+
+            )
 
         )
 
+    except Exception as error:
+
+        raise RuntimeError(
+            f"Gemini chat request failed: {error}"
+        ) from error
+
+    # --------------------------------------------------------
+    # GET RESPONSE
+    # --------------------------------------------------------
+
+    answer = getattr(
+        response,
+        "text",
+        None
     )
-
-
-    # --------------------------------------------------------
-    # RETURN RESPONSE
-    # --------------------------------------------------------
-
-    answer = (
-        response.text or ""
-    ).strip()
-
 
     if not answer:
 
         return (
-            "I could not generate a response. "
+            "I could not generate a response right now. "
             "Please try again."
         )
 
+    return answer.strip()
 
-    return answer
+
+# ============================================================
+# OPTIONAL MODEL INFORMATION
+# ============================================================
+
+def get_model_name() -> str:
+    """
+    Return the Gemini model currently being used.
+    """
+
+    return MODEL
