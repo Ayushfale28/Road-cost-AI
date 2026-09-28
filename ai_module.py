@@ -33,7 +33,7 @@ CHAT_PROMPT_PATH = BASE_DIR / "chat_prompt.xml"
 
 MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-2.5-flash"
+    "gemini-3.8-flash"
 )
 
 
