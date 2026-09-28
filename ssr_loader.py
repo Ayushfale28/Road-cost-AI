@@ -16,6 +16,8 @@ import io
 import re
 
 import pandas as pd
+import pdfplumber
+from docx import Document
 
 
 # ============================================================
