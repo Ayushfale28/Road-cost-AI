@@ -1,20 +1,35 @@
 """
 AI module for the Road Cost Estimator.
 
-This file handles:
-1. Road photo analysis using Gemini
-2. Road Project Chat Assistant using Gemini
+Gemini is OPTIONAL.
 
-The AI only provides suggestions.
-Final engineering decisions must be made by the user/engineer.
+If a Gemini API key is available:
+    - Road photos can be analyzed using Gemini.
+    - Chat Assistant uses Gemini.
+
+If no Gemini API key is available:
+    - The application continues to work.
+    - Photo analysis uses a safe fallback.
+    - Chat Assistant uses a rule-based road-planning assistant.
 """
 
 import json
 import os
 from pathlib import Path
 
-from google import genai
-from google.genai import types
+
+# ============================================================
+# OPTIONAL GEMINI IMPORT
+# ============================================================
+
+try:
+    from google import genai
+    from google.genai import types
+
+    GEMINI_AVAILABLE = True
+
+except ImportError:
+    GEMINI_AVAILABLE = False
 
 
 # ============================================================
@@ -33,98 +48,88 @@ CHAT_PROMPT_PATH = BASE_DIR / "chat_prompt.xml"
 
 MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-3.8-flash"
+    "gemini-2.5-flash"
 )
 
 
 # ============================================================
-# PROMPT LOADER
+# LOAD PROMPT FILE
 # ============================================================
 
-def load_prompt(file_path: Path) -> str:
+def load_prompt(file_path):
     """
-    Load an XML prompt file from the same folder
-    as this Python file.
+    Read an XML prompt file.
     """
 
     if not file_path.exists():
-        raise FileNotFoundError(
-            f"Required prompt file was not found: "
-            f"{file_path.name}"
-        )
 
-    try:
-        return file_path.read_text(
-            encoding="utf-8"
-        )
+        return ""
 
-    except Exception as error:
-        raise RuntimeError(
-            f"Could not read prompt file "
-            f"'{file_path.name}': {error}"
-        ) from error
+    return file_path.read_text(
+        encoding="utf-8"
+    )
 
 
 # ============================================================
-# GEMINI CLIENT
+# CHECK GEMINI
 # ============================================================
 
-def create_client(api_key: str):
+def gemini_is_available(api_key=None):
     """
-    Create and return a Gemini client.
+    Returns True only when Gemini package and API key
+    are both available.
     """
 
-    if not api_key or not api_key.strip():
-        raise ValueError(
-            "Gemini API key is missing. "
-            "Please provide a valid Gemini API key."
-        )
+    if not GEMINI_AVAILABLE:
+        return False
 
-    try:
-        return genai.Client(
-            api_key=api_key.strip()
-        )
+    if api_key and api_key.strip():
+        return True
 
-    except Exception as error:
-        raise RuntimeError(
-            f"Could not create Gemini client: {error}"
-        ) from error
+    return False
 
 
 # ============================================================
-# CLEAN GEMINI JSON RESPONSE
+# ROAD PHOTO FALLBACK ANALYSIS
 # ============================================================
 
-def clean_json_response(text: str) -> str:
+def fallback_photo_analysis(note=""):
     """
-    Clean a Gemini response before JSON parsing.
+    Safe fallback when Gemini API is not available.
 
-    Gemini should normally return pure JSON because
-    response_mime_type is set to application/json.
-
-    This function also handles accidental markdown
-    code fences.
+    IMPORTANT:
+    This does NOT pretend that an image was analyzed by AI.
     """
 
-    if not text:
-        raise ValueError(
-            "Gemini returned an empty response."
+    observations = [
+        "Photo analysis is not available because no Gemini API key was provided.",
+        "The uploaded image should be reviewed by the site engineer.",
+        "Do not use this result as a final engineering decision."
+    ]
+
+    if note and note.strip():
+
+        observations.append(
+            "Engineer's note: " + note.strip()
         )
 
-    text = text.strip()
+    return {
 
-    # Remove ```json ... ```
-    if text.startswith("```json"):
-        text = text[len("```json"):].strip()
+        "recommended_mode": None,
 
-    # Remove ``` ... ```
-    elif text.startswith("```"):
-        text = text[len("```"):].strip()
+        "confidence": "not_available",
 
-    if text.endswith("```"):
-        text = text[:-3].strip()
+        "observations": observations,
 
-    return text
+        "source": "manual_review_required",
+
+        "message": (
+            "I cannot reliably determine whether this is "
+            "road repair or new construction without AI "
+            "photo analysis. Please confirm the work type."
+        )
+
+    }
 
 
 # ============================================================
@@ -134,35 +139,47 @@ def clean_json_response(text: str) -> str:
 def analyze_photo(
     image_bytes: bytes,
     mime_type: str,
-    api_key: str,
+    api_key: str = "",
     note: str = ""
 ) -> dict:
-    """
-    Analyze a road/site photo using Gemini.
 
-    Returns a Python dictionary containing the structured
-    AI analysis defined in road_photo_prompt.xml.
+    """
+    Analyze road photo.
+
+    If Gemini API key exists:
+        Use Gemini.
+
+    If Gemini API key does not exist:
+        Return safe fallback.
     """
 
     # --------------------------------------------------------
-    # VALIDATE IMAGE
+    # NO GEMINI KEY
     # --------------------------------------------------------
 
-    if not image_bytes:
-        raise ValueError(
-            "No image was provided."
+    if not gemini_is_available(api_key):
+
+        return fallback_photo_analysis(
+            note=note
         )
 
-    if not mime_type:
-        mime_type = "image/jpeg"
 
     # --------------------------------------------------------
-    # CREATE CLIENT
+    # CREATE GEMINI CLIENT
     # --------------------------------------------------------
 
-    client = create_client(
-        api_key
-    )
+    try:
+
+        client = genai.Client(
+            api_key=api_key.strip()
+        )
+
+    except Exception:
+
+        return fallback_photo_analysis(
+            note=note
+        )
+
 
     # --------------------------------------------------------
     # LOAD PHOTO PROMPT
@@ -172,23 +189,27 @@ def analyze_photo(
         PHOTO_PROMPT_PATH
     )
 
+
     # --------------------------------------------------------
     # USER MESSAGE
     # --------------------------------------------------------
 
     user_text = (
-        "Analyse this site photo according to "
-        "the instructions provided."
+        "Analyse this road photo according "
+        "to the instructions provided."
     )
 
+
     if note and note.strip():
+
         user_text += (
-            "\n\nEngineer's additional note:\n"
+            "\n\nEngineer's additional note: "
             + note.strip()
         )
 
+
     # --------------------------------------------------------
-    # SEND PHOTO TO GEMINI
+    # SEND REQUEST TO GEMINI
     # --------------------------------------------------------
 
     try:
@@ -217,62 +238,413 @@ def analyze_photo(
 
     except Exception as error:
 
-        raise RuntimeError(
-            f"Gemini photo analysis failed: {error}"
-        ) from error
+        return {
+
+            "recommended_mode": None,
+
+            "confidence": "not_available",
+
+            "observations": [
+                "Gemini photo analysis could not be completed.",
+                "Please review the uploaded photo manually.",
+                "Site engineer confirmation is required."
+            ],
+
+            "source": "gemini_error",
+
+            "error": str(error)
+
+        }
+
 
     # --------------------------------------------------------
-    # GET RESPONSE
+    # GET RESPONSE TEXT
     # --------------------------------------------------------
 
-    response_text = getattr(
-        response,
-        "text",
-        None
-    )
+    text = (
+        response.text or ""
+    ).strip()
 
-    if not response_text:
 
-        raise ValueError(
-            "Gemini did not return any photo analysis."
+    if not text:
+
+        return fallback_photo_analysis(
+            note=note
         )
 
-    # --------------------------------------------------------
-    # CLEAN RESPONSE
-    # --------------------------------------------------------
-
-    cleaned_text = clean_json_response(
-        response_text
-    )
 
     # --------------------------------------------------------
-    # PARSE JSON
+    # REMOVE MARKDOWN CODE BLOCK
+    # --------------------------------------------------------
+
+    if text.startswith("```json"):
+
+        text = text[
+            len("```json"):
+        ]
+
+    elif text.startswith("```"):
+
+        text = text[
+            len("```"):
+        ]
+
+
+    if text.endswith("```"):
+
+        text = text[
+            :-len("```")
+        ]
+
+
+    text = text.strip()
+
+
+    # --------------------------------------------------------
+    # CONVERT JSON
     # --------------------------------------------------------
 
     try:
 
         result = json.loads(
-            cleaned_text
+            text
         )
 
-    except json.JSONDecodeError as error:
+    except json.JSONDecodeError:
 
-        raise ValueError(
-            "Gemini returned an invalid JSON response. "
-            "Please try analyzing the photo again."
-        ) from error
+        return {
+
+            "recommended_mode": None,
+
+            "confidence": "not_available",
+
+            "observations": [
+                "The AI response could not be interpreted safely.",
+                "Please review the photo manually."
+            ],
+
+            "source": "invalid_ai_response"
+
+        }
+
 
     # --------------------------------------------------------
-    # BASIC VALIDATION
+    # SAFETY DEFAULTS
     # --------------------------------------------------------
 
     if not isinstance(result, dict):
 
-        raise ValueError(
-            "Gemini returned an unexpected response format."
+        return fallback_photo_analysis(
+            note=note
         )
 
+
+    result.setdefault(
+        "recommended_mode",
+        None
+    )
+
+    result.setdefault(
+        "confidence",
+        "unknown"
+    )
+
+    result.setdefault(
+        "observations",
+        []
+    )
+
+    result.setdefault(
+        "source",
+        "gemini"
+    )
+
+
     return result
+
+
+# ============================================================
+# RULE-BASED CHAT ASSISTANT
+# ============================================================
+
+def fallback_chat_reply(
+    history,
+    analysis=None
+):
+    """
+    Road-planning assistant that works without Gemini.
+
+    It does not calculate quantities, rates or costs.
+    """
+
+    if not history:
+
+        return (
+            "Namaste! I can help you plan the road work. "
+            "First, is this repair of an existing road "
+            "or construction of a new road?"
+        )
+
+
+    last_message = history[-1]
+
+    user_text = str(
+        last_message.get(
+            "content",
+            ""
+        )
+    ).strip()
+
+
+    text = user_text.lower()
+
+
+    # ========================================================
+    # WORK TYPE
+    # ========================================================
+
+    repair_words = [
+        "repair",
+        "maintenance",
+        "existing road",
+        "damaged road",
+        "road damage",
+        "pothole",
+        "patch"
+    ]
+
+    new_words = [
+        "new road",
+        "new construction",
+        "construct",
+        "construction",
+        "build road"
+    ]
+
+
+    if any(word in text for word in repair_words):
+
+        return (
+            "Okay, we will consider this as repair/maintenance "
+            "of an existing road. What is the approximate "
+            "road length?"
+        )
+
+
+    if any(word in text for word in new_words):
+
+        return (
+            "Okay, we will consider this as a new road. "
+            "Do you want a CC (concrete) road or a dambar "
+            "(bitumen) road?"
+        )
+
+
+    # ========================================================
+    # CC / BITUMEN
+    # ========================================================
+
+    if (
+        "cc" in text
+        or "concrete" in text
+    ):
+
+        return (
+            "Got it — CC road. What is the approximate "
+            "road length?"
+        )
+
+
+    if (
+        "bitumen" in text
+        or "dambar" in text
+        or "asphalt" in text
+    ):
+
+        return (
+            "Got it — bitumen/dambar road. What is the "
+            "approximate road length?"
+        )
+
+
+    # ========================================================
+    # LENGTH
+    # ========================================================
+
+    if (
+        "km" in text
+        or "meter" in text
+        or "metre" in text
+        or "length" in text
+    ):
+
+        return (
+            "Thank you. Now, what is the approximate "
+            "road width?"
+        )
+
+
+    # ========================================================
+    # WIDTH
+    # ========================================================
+
+    if "width" in text:
+
+        return (
+            "Thank you. What layer thickness has been "
+            "specified or proposed by the site engineer?"
+        )
+
+
+    # ========================================================
+    # THICKNESS
+    # ========================================================
+
+    if (
+        "thickness" in text
+        or "mm" in text
+        or "cm" in text
+    ):
+
+        return (
+            "Noted. What type of traffic is expected on "
+            "this road — light, medium, or heavy?"
+        )
+
+
+    # ========================================================
+    # TRAFFIC
+    # ========================================================
+
+    if (
+        "traffic" in text
+        or "heavy" in text
+        or "medium" in text
+        or "light" in text
+    ):
+
+        return (
+            "Okay. What is the soil or sub-grade condition "
+            "at the site?"
+        )
+
+
+    # ========================================================
+    # SOIL
+    # ========================================================
+
+    if (
+        "soil" in text
+        or "subgrade" in text
+        or "sub-grade" in text
+        or "black soil" in text
+        or "clay" in text
+        or "murum" in text
+    ):
+
+        return (
+            "Understood. Is any drainage work or culvert "
+            "required at the site?"
+        )
+
+
+    # ========================================================
+    # DRAINAGE
+    # ========================================================
+
+    if (
+        "drainage" in text
+        or "culvert" in text
+        or "cross drainage" in text
+        or "cd work" in text
+    ):
+
+        return (
+            "Noted. What is the approximate lead distance "
+            "for bringing construction materials to the site?"
+        )
+
+
+    # ========================================================
+    # LEAD
+    # ========================================================
+
+    if (
+        "lead" in text
+        or "distance" in text
+        or "transport" in text
+    ):
+
+        return (
+            "Thank you. For the estimate, you can now select "
+            "the relevant items in the Estimate tab. "
+            "Check the applicable SSR chapters such as Road "
+            "Sub grade, Road Sub Base and Base Course, "
+            "Rigid Pavement, Road Surfacing Course, Road "
+            "Maintenance, or Cross Drainage Works."
+        )
+
+
+    # ========================================================
+    # SSR QUESTIONS
+    # ========================================================
+
+    if (
+        "ssr" in text
+        or "rate" in text
+        or "cost" in text
+        or "item number" in text
+    ):
+
+        return (
+            "Please select the required item from the SSR "
+            "file in the Estimate tab. I will not invent "
+            "SSR item numbers, rates, quantities, or costs."
+        )
+
+
+    # ========================================================
+    # ESTIMATE QUESTIONS
+    # ========================================================
+
+    if (
+        "estimate" in text
+        or "quantity" in text
+    ):
+
+        return (
+            "The Estimate tab should be used for selecting "
+            "the applicable SSR items and rates. Please verify "
+            "the engineering measurements with the site engineer."
+        )
+
+
+    # ========================================================
+    # PHOTO ANALYSIS
+    # ========================================================
+
+    if (
+        "photo" in text
+        or "image" in text
+    ):
+
+        return (
+            "The photo can provide a helpful indication, but "
+            "it should not replace the site engineer's judgment. "
+            "Please confirm whether the work is repair or "
+            "new construction."
+        )
+
+
+    # ========================================================
+    # DEFAULT
+    # ========================================================
+
+    return (
+        "I can help you collect the road-planning information. "
+        "First, is this repair of an existing road or "
+        "construction of a new road?"
+    )
 
 
 # ============================================================
@@ -281,91 +653,84 @@ def analyze_photo(
 
 def chat_reply(
     history: list,
-    api_key: str,
+    api_key: str = "",
     analysis: dict | None = None,
     image_bytes: bytes | None = None,
     mime_type: str = "image/jpeg"
 ) -> str:
+
     """
-    Generate a response from the Road Project Chat Assistant.
+    Generate a response for the Road Project Chat Assistant.
 
-    history format:
+    Gemini is optional.
 
-    [
-        {
-            "role": "user",
-            "content": "..."
-        },
-        {
-            "role": "assistant",
-            "content": "..."
-        }
-    ]
-
-    The optional photo analysis is added as context.
+    Without Gemini:
+        Uses fallback road-planning assistant.
     """
 
-    # --------------------------------------------------------
-    # CREATE CLIENT
-    # --------------------------------------------------------
+    # ========================================================
+    # NO GEMINI
+    # ========================================================
 
-    client = create_client(
-        api_key
-    )
+    if not gemini_is_available(api_key):
 
-    # --------------------------------------------------------
+        return fallback_chat_reply(
+            history=history,
+            analysis=analysis
+        )
+
+
+    # ========================================================
+    # CREATE GEMINI CLIENT
+    # ========================================================
+
+    try:
+
+        client = genai.Client(
+            api_key=api_key.strip()
+        )
+
+    except Exception:
+
+        return fallback_chat_reply(
+            history=history,
+            analysis=analysis
+        )
+
+
+    # ========================================================
     # LOAD CHAT PROMPT
-    # --------------------------------------------------------
+    # ========================================================
 
     system_prompt = load_prompt(
         CHAT_PROMPT_PATH
     )
 
-    # --------------------------------------------------------
+
+    # ========================================================
     # ADD PHOTO ANALYSIS
-    # --------------------------------------------------------
+    # ========================================================
 
     if analysis:
 
-        try:
-
-            analysis_json = json.dumps(
+        system_prompt += (
+            "\n\n<photo_analysis>\n"
+            + json.dumps(
                 analysis,
                 ensure_ascii=False
             )
-
-        except Exception:
-
-            analysis_json = str(
-                analysis
-            )
-
-        system_prompt += (
-            "\n\n"
-            "<photo_analysis>\n"
-            + analysis_json
             + "\n</photo_analysis>"
         )
 
-    # --------------------------------------------------------
+
+    # ========================================================
     # PREPARE CHAT HISTORY
-    # --------------------------------------------------------
+    # ========================================================
 
     contents = []
 
-    if not history:
-
-        raise ValueError(
-            "Chat history is empty."
-        )
 
     for index, message in enumerate(history):
-
-        if not isinstance(
-            message,
-            dict
-        ):
-            continue
 
         role = message.get(
             "role",
@@ -377,30 +742,15 @@ def chat_reply(
             ""
         )
 
-        if not content:
-            continue
-
-        # ----------------------------------------------------
-        # CONVERT ROLE
-        # ----------------------------------------------------
-
-        if role == "assistant":
-            gemini_role = "model"
-
-        else:
-            gemini_role = "user"
-
-        # ----------------------------------------------------
-        # TEXT PART
-        # ----------------------------------------------------
 
         parts = [
 
             types.Part.from_text(
-                text=str(content)
+                text=content
             )
 
         ]
+
 
         # ----------------------------------------------------
         # ATTACH PHOTO TO FIRST USER MESSAGE
@@ -411,9 +761,6 @@ def chat_reply(
             and role == "user"
             and image_bytes
         ):
-
-            if not mime_type:
-                mime_type = "image/jpeg"
 
             parts.insert(
 
@@ -429,9 +776,21 @@ def chat_reply(
 
             )
 
+
         # ----------------------------------------------------
-        # ADD MESSAGE TO GEMINI HISTORY
+        # GEMINI ROLE
         # ----------------------------------------------------
+
+        gemini_role = (
+
+            "user"
+
+            if role == "user"
+
+            else "model"
+
+        )
+
 
         contents.append(
 
@@ -445,19 +804,10 @@ def chat_reply(
 
         )
 
-    # --------------------------------------------------------
-    # CHECK HISTORY
-    # --------------------------------------------------------
 
-    if not contents:
-
-        raise ValueError(
-            "No valid messages were found in chat history."
-        )
-
-    # --------------------------------------------------------
+    # ========================================================
     # SEND CHAT REQUEST
-    # --------------------------------------------------------
+    # ========================================================
 
     try:
 
@@ -477,39 +827,29 @@ def chat_reply(
 
         )
 
-    except Exception as error:
+    except Exception:
 
-        raise RuntimeError(
-            f"Gemini chat request failed: {error}"
-        ) from error
+        return fallback_chat_reply(
+            history=history,
+            analysis=analysis
+        )
 
-    # --------------------------------------------------------
-    # GET RESPONSE
-    # --------------------------------------------------------
 
-    answer = getattr(
-        response,
-        "text",
-        None
-    )
+    # ========================================================
+    # RETURN RESPONSE
+    # ========================================================
+
+    answer = (
+        response.text or ""
+    ).strip()
+
 
     if not answer:
 
-        return (
-            "I could not generate a response right now. "
-            "Please try again."
+        return fallback_chat_reply(
+            history=history,
+            analysis=analysis
         )
 
-    return answer.strip()
 
-
-# ============================================================
-# OPTIONAL MODEL INFORMATION
-# ============================================================
-
-def get_model_name() -> str:
-    """
-    Return the Gemini model currently being used.
-    """
-
-    return MODEL
+    return answer
