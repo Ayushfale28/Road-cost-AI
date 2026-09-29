@@ -833,3 +833,254 @@ def chat_reply(
             "The road assistant is temporarily "
             "unavailable. Please try again later."
         )
+      # ============================================================
+# AI PROJECT SPECIFICATION
+# ============================================================
+
+def generate_project_specification(
+    mode,
+    road_type,
+    length_m,
+    width_m,
+    thickness_mm,
+    soil_condition="",
+    traffic_type="",
+    drainage_required="",
+    lead_distance_km=0.0,
+    additional_prompt="",
+    photo_analysis=None
+):
+    """
+    Convert the user's project information into a structured
+    engineering/project specification.
+
+    The AI does NOT provide SSR rates or invent SSR item numbers.
+
+    It only identifies:
+        - project type
+        - road type
+        - required work categories
+        - relevant keywords
+        - engineering information
+
+    The actual SSR items and rates must come from the SSR database.
+    """
+
+    system_prompt = """
+You are an AI road estimation planning assistant.
+
+Your job is to understand a road construction or repair project
+and identify the types of work that may be required.
+
+IMPORTANT RULES:
+
+1. Never invent SSR item numbers.
+2. Never invent SSR rates.
+3. Never invent quantities.
+4. Do not provide a final cost.
+5. SSR items and rates will be obtained from the application's
+   actual SSR database.
+6. Measurements supplied by the user must be preserved exactly.
+7. Identify relevant construction/repair work categories.
+8. Return ONLY valid JSON.
+
+The final estimate will be calculated by the application's
+engineering calculation engine.
+"""
+
+    project_information = {
+        "mode": mode,
+        "road_type": road_type,
+        "length_m": length_m,
+        "width_m": width_m,
+        "thickness_mm": thickness_mm,
+        "soil_condition": soil_condition,
+        "traffic_type": traffic_type,
+        "drainage_required": drainage_required,
+        "lead_distance_km": lead_distance_km,
+        "additional_prompt": additional_prompt
+    }
+
+    if photo_analysis:
+
+        project_information[
+            "photo_analysis"
+        ] = photo_analysis
+
+    user_prompt = f"""
+Analyse the following road project.
+
+PROJECT INFORMATION:
+
+{json.dumps(
+    project_information,
+    ensure_ascii=False,
+    indent=2
+)}
+
+Identify the work categories that should be considered
+for this project.
+
+For example, depending on the project:
+
+- site preparation
+- cleaning
+- excavation
+- subgrade
+- sub-base
+- base course
+- concrete pavement
+- bituminous pavement
+- joints
+- drainage
+- road furniture
+- road safety
+- maintenance
+- pothole repair
+
+Do NOT assume that every category is required.
+
+Only recommend categories that are reasonably supported
+by the project information.
+
+Return this JSON:
+
+{{
+    "project_type": "",
+    "road_type": "",
+    "work_categories": [
+        {{
+            "category": "",
+            "reason": "",
+            "search_keywords": []
+        }}
+    ],
+    "additional_requirements": [],
+    "missing_information": []
+}}
+"""
+
+    messages = [
+        {
+            "role": "user",
+            "content": user_prompt
+        }
+    ]
+
+    response = _openrouter_request(
+        messages=messages,
+        system_prompt=system_prompt,
+        temperature=0.1,
+        json_mode=True
+    )
+
+    return parse_json_response(
+        response
+    )
+
+
+# ============================================================
+# AI SSR ITEM REVIEW
+# ============================================================
+
+def review_ssr_candidates(
+    project_specification,
+    candidate_items
+):
+    """
+    Ask the generative AI to review SSR candidates.
+
+    IMPORTANT:
+    The AI can only choose from the candidates supplied by
+    the application.
+
+    It cannot create new SSR items or rates.
+    """
+
+    if not candidate_items:
+
+        return []
+
+    system_prompt = """
+You are an SSR item selection assistant for a road
+estimation application.
+
+You will receive:
+
+1. A structured road project specification.
+2. A list of actual SSR items from the application's
+   SSR database.
+
+Your task is to identify which supplied SSR items
+are relevant to the project.
+
+STRICT RULES:
+
+- You may ONLY select items from the supplied list.
+- Never invent an item number.
+- Never invent an SSR rate.
+- Never change the SSR description.
+- Never create an item that is not supplied.
+- Do not calculate quantities.
+- Do not calculate costs.
+- Select only items reasonably required for the project.
+- If an item is uncertain, do not select it.
+
+Return ONLY valid JSON.
+"""
+
+    user_prompt = f"""
+PROJECT SPECIFICATION:
+
+{json.dumps(
+    project_specification,
+    ensure_ascii=False,
+    indent=2
+)}
+
+AVAILABLE SSR ITEMS:
+
+{json.dumps(
+    candidate_items,
+    ensure_ascii=False,
+    indent=2
+)}
+
+Return:
+
+{{
+    "selected_items": [
+        {{
+            "id": "",
+            "reason": "",
+            "confidence": "low | medium | high"
+        }}
+    ],
+    "excluded_items": [
+        {{
+            "id": "",
+            "reason": ""
+        }}
+    ]
+}}
+"""
+
+    messages = [
+        {
+            "role": "user",
+            "content": user_prompt
+        }
+    ]
+
+    response = _openrouter_request(
+        messages=messages,
+        system_prompt=system_prompt,
+        temperature=0.1,
+        json_mode=True
+    )
+
+    result = parse_json_response(
+        response
+    )
+
+    return result
