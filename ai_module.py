@@ -1,22 +1,19 @@
 """
-AI module for the Road Cost Estimator.
+AI backend module for the Road Cost Estimator.
 
 This file handles:
 1. Road photo analysis
-2. Road Project Chat Assistant
+2. Road project chat assistant
 
 IMPORTANT:
-- API keys are NOT entered by website users.
-- The API key is read from the server environment / Streamlit secrets.
-- The AI provider is hidden from the application UI.
-- The rest of the application only calls analyze_photo()
-  and chat_reply().
+- API keys are NEVER requested from the website user.
+- The API key is read only from Streamlit secrets or environment variables.
+- The AI provider is intentionally hidden from the user interface.
 """
 
 import json
 import os
 from pathlib import Path
-from typing import Optional
 
 from google import genai
 from google.genai import types
@@ -33,15 +30,9 @@ CHAT_PROMPT_PATH = BASE_DIR / "chat_prompt.xml"
 
 
 # ============================================================
-# MODEL CONFIGURATION
+# MODEL
 # ============================================================
 
-# This can be changed on the server without changing the code.
-#
-# Example environment variable:
-# GEMINI_MODEL=gemini-2.5-flash
-#
-# Users never see this value.
 MODEL = os.getenv(
     "GEMINI_MODEL",
     "gemini-2.5-flash"
@@ -49,59 +40,80 @@ MODEL = os.getenv(
 
 
 # ============================================================
-# BASIC HELPERS
+# INTERNAL API KEY
 # ============================================================
 
-def _get_api_key(api_key: Optional[str] = None) -> str:
+def get_api_key():
     """
-    Get the AI API key.
+    Get the AI API key from backend configuration.
 
     Priority:
-    1. Explicit server-side value passed by the application.
-    2. GEMINI_API_KEY environment variable.
+    1. Streamlit secrets
+    2. Environment variable
 
-    There is intentionally NO user-facing API-key handling here.
+    The user never enters the key in the UI.
     """
 
-    if api_key and str(api_key).strip():
-        return str(api_key).strip()
+    # --------------------------------------------------------
+    # Try Streamlit Secrets
+    # --------------------------------------------------------
 
-    environment_key = os.getenv(
+    try:
+        import streamlit as st
+
+        key = st.secrets.get(
+            "GEMINI_API_KEY",
+            ""
+        )
+
+        if key:
+            return str(key).strip()
+
+    except Exception:
+        pass
+
+
+    # --------------------------------------------------------
+    # Try Environment Variable
+    # --------------------------------------------------------
+
+    key = os.getenv(
         "GEMINI_API_KEY",
         ""
-    ).strip()
+    )
 
-    if environment_key:
-        return environment_key
+    if key:
+        return key.strip()
 
-    raise RuntimeError(
-        "AI service is not configured."
+
+    return ""
+
+
+# ============================================================
+# PROMPT LOADER
+# ============================================================
+
+def load_prompt(file_path: Path) -> str:
+    """
+    Load an XML prompt file.
+    """
+
+    if not file_path.exists():
+
+        raise FileNotFoundError(
+            f"Required AI prompt file is missing: {file_path.name}"
+        )
+
+    return file_path.read_text(
+        encoding="utf-8"
     )
 
 
-def _load_prompt(path: Path) -> str:
-    """
-    Load an XML prompt from the application folder.
-    """
+# ============================================================
+# JSON CLEANER
+# ============================================================
 
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Required AI prompt file is missing: {path.name}"
-        )
-
-    text = path.read_text(
-        encoding="utf-8"
-    ).strip()
-
-    if not text:
-        raise ValueError(
-            f"AI prompt file is empty: {path.name}"
-        )
-
-    return text
-
-
-def _clean_json_response(text: str) -> str:
+def clean_json_response(text: str) -> str:
     """
     Remove accidental Markdown code fences from an AI response.
     """
@@ -109,65 +121,21 @@ def _clean_json_response(text: str) -> str:
     text = (text or "").strip()
 
     if not text:
-        raise ValueError(
-            "AI returned an empty response."
-        )
+        return ""
 
-    # Handle ```json ... ```
     if text.startswith("```json"):
-        text = text[len("```json"):].strip()
 
-    # Handle ``` ... ```
+        text = text[len("```json"):]
+
     elif text.startswith("```"):
-        text = text[len("```"):].strip()
+
+        text = text[len("```"):]
 
     if text.endswith("```"):
-        text = text[:-3].strip()
 
-    return text
+        text = text[:-3]
 
-
-def _parse_json_response(text: str) -> dict:
-    """
-    Convert AI JSON response into a Python dictionary.
-    """
-
-    cleaned = _clean_json_response(
-        text
-    )
-
-    try:
-        result = json.loads(
-            cleaned
-        )
-
-    except json.JSONDecodeError as error:
-
-        raise ValueError(
-            "AI returned an invalid structured response."
-        ) from error
-
-    if not isinstance(result, dict):
-
-        raise ValueError(
-            "AI response was not a JSON object."
-        )
-
-    return result
-
-
-def _create_client(api_key: Optional[str] = None):
-    """
-    Create the AI client using the server-side API key.
-    """
-
-    key = _get_api_key(
-        api_key
-    )
-
-    return genai.Client(
-        api_key=key
-    )
+    return text.strip()
 
 
 # ============================================================
@@ -177,132 +145,292 @@ def _create_client(api_key: Optional[str] = None):
 def analyze_photo(
     image_bytes: bytes,
     mime_type: str,
-    api_key: Optional[str] = None,
+    api_key: str | None = None,
     note: str = ""
 ) -> dict:
     """
-    Analyze one road/site photograph.
+    Analyze one road photograph.
 
-    Parameters
-    ----------
-    image_bytes:
-        Raw image bytes.
+    The API key argument is retained for compatibility with
+    existing app.py versions, but the website should not ask
+    the user for it.
 
-    mime_type:
-        Example:
-        image/jpeg
-        image/png
-        image/webp
-
-    api_key:
-        Optional server-side key.
-        Normally the application should leave this as None.
-
-    note:
-        Optional engineer/site note.
-
-    Returns
-    -------
-    dict
-        Structured road analysis.
+    The actual key is obtained from backend configuration.
     """
 
-    if not image_bytes:
-        raise ValueError(
-            "No image was provided."
+    # --------------------------------------------------------
+    # Use backend key
+    # --------------------------------------------------------
+
+    backend_key = get_api_key()
+
+    if not backend_key:
+
+        raise RuntimeError(
+            "AI analysis is currently unavailable."
         )
 
-    if not mime_type:
-        mime_type = "image/jpeg"
 
     # --------------------------------------------------------
-    # CREATE CLIENT
+    # Validate image
     # --------------------------------------------------------
 
-    client = _create_client(
-        api_key
+    if not image_bytes:
+
+        raise ValueError(
+            "No image data was provided."
+        )
+
+
+    # --------------------------------------------------------
+    # Create client
+    # --------------------------------------------------------
+
+    client = genai.Client(
+        api_key=backend_key
     )
 
+
     # --------------------------------------------------------
-    # LOAD PHOTO PROMPT
+    # Load prompt
     # --------------------------------------------------------
 
-    system_prompt = _load_prompt(
+    system_prompt = load_prompt(
         PHOTO_PROMPT_PATH
     )
 
+
     # --------------------------------------------------------
-    # USER MESSAGE
+    # User message
     # --------------------------------------------------------
 
     user_text = (
-        "Analyse this road/site photo according "
-        "to the provided instructions."
+        "Analyse this road/site photograph according "
+        "to the instructions provided."
     )
+
 
     if note and note.strip():
 
         user_text += (
-            "\n\nEngineer's site note: "
+            "\n\nEngineer's additional note: "
             + note.strip()
         )
 
+
     # --------------------------------------------------------
-    # GENERATE RESPONSE
+    # Gemini request
     # --------------------------------------------------------
 
-    try:
+    response = client.models.generate_content(
 
-        response = client.models.generate_content(
+        model=MODEL,
 
-            model=MODEL,
+        contents=[
+            types.Part.from_bytes(
+                data=image_bytes,
+                mime_type=mime_type
+            ),
+            user_text
+        ],
 
-            contents=[
-                types.Part.from_bytes(
-                    data=image_bytes,
-                    mime_type=mime_type
-                ),
-                user_text
-            ],
+        config=types.GenerateContentConfig(
 
-            config=types.GenerateContentConfig(
+            system_instruction=system_prompt,
 
-                system_instruction=system_prompt,
+            response_mime_type="application/json",
 
-                response_mime_type="application/json",
+            temperature=0.2
 
-                temperature=0.2
-            )
         )
+    )
 
-    except Exception as error:
-
-        # Do NOT expose provider/API details to the user.
-        raise RuntimeError(
-            "AI photo analysis is temporarily unavailable."
-        ) from error
 
     # --------------------------------------------------------
-    # READ RESPONSE
+    # Read response
     # --------------------------------------------------------
 
-    text = (
-        response.text or ""
-    ).strip()
+    text = clean_json_response(
+        response.text
+    )
+
 
     if not text:
 
         raise RuntimeError(
-            "AI photo analysis returned no result."
+            "AI analysis returned no result."
         )
 
+
     # --------------------------------------------------------
-    # PARSE JSON
+    # Parse JSON
     # --------------------------------------------------------
 
-    return _parse_json_response(
-        text
-    )
+    try:
+
+        result = json.loads(
+            text
+        )
+
+    except json.JSONDecodeError as error:
+
+        raise RuntimeError(
+            "AI analysis returned an invalid result."
+        ) from error
+
+
+    if not isinstance(
+        result,
+        dict
+    ):
+
+        raise RuntimeError(
+            "AI analysis returned an unexpected format."
+        )
+
+
+    return result
+
+
+# ============================================================
+# MULTI-PHOTO ANALYSIS
+# ============================================================
+
+def analyze_photos(
+    photos: list,
+    note: str = ""
+) -> list:
+    """
+    Analyze multiple uploaded photos.
+
+    Expected photo format:
+
+    {
+        "name": "...",
+        "bytes": b"...",
+        "mime": "image/jpeg"
+    }
+
+    Returns:
+
+    [
+        {
+            "name": "...",
+            "result": {...}
+        }
+    ]
+    """
+
+    results = []
+
+
+    for photo in photos:
+
+        name = photo.get(
+            "name",
+            "Photo"
+        )
+
+        image_bytes = photo.get(
+            "bytes"
+        )
+
+        mime_type = photo.get(
+            "mime",
+            "image/jpeg"
+        )
+
+
+        try:
+
+            result = analyze_photo(
+
+                image_bytes=image_bytes,
+
+                mime_type=mime_type,
+
+                note=note
+
+            )
+
+            results.append(
+
+                {
+                    "name": name,
+                    "result": result
+                }
+
+            )
+
+
+        except Exception:
+
+            # Do not expose provider/API details
+            # to the website user.
+
+            results.append(
+
+                {
+                    "name": name,
+
+                    "result": {
+
+                        "photo_quality": (
+                            "poor - analysis unavailable"
+                        ),
+
+                        "site_type": {
+
+                            "value": "unclear",
+
+                            "confidence": "low"
+
+                        },
+
+                        "recommended_mode": {
+
+                            "value": "unclear",
+
+                            "confidence": "low",
+
+                            "reason": (
+                                "Photo could not be "
+                                "automatically analysed."
+                            )
+
+                        },
+
+                        "road_type": {
+
+                            "value": "unclear",
+
+                            "confidence": "low"
+
+                        },
+
+                        "surface_condition": (
+                            "Manual site review required."
+                        ),
+
+                        "defects": [],
+
+                        "suggested_works": [],
+
+                        "suggested_parameters": [],
+
+                        "limitations": (
+                            "Automatic photo analysis "
+                            "was unavailable."
+                        )
+
+                    }
+
+                }
+
+            )
+
+
+    return results
 
 
 # ============================================================
@@ -311,88 +439,75 @@ def analyze_photo(
 
 def chat_reply(
     history: list,
-    api_key: Optional[str] = None,
-    analysis: Optional[dict] = None,
-    image_bytes: Optional[bytes] = None,
+    api_key: str | None = None,
+    analysis: dict | None = None,
+    image_bytes: bytes | None = None,
     mime_type: str = "image/jpeg"
 ) -> str:
     """
-    Generate a response for the Road Project Chat Assistant.
+    Generate a response from the road project assistant.
 
-    history format:
-
-    [
-        {
-            "role": "user",
-            "content": "..."
-        },
-        {
-            "role": "assistant",
-            "content": "..."
-        }
-    ]
-
-    The function remains compatible with the existing app.py.
+    API key is obtained internally.
     """
 
-    if not history:
+    # --------------------------------------------------------
+    # Backend API key
+    # --------------------------------------------------------
+
+    backend_key = get_api_key()
+
+    if not backend_key:
+
         return (
-            "Please enter your road project question."
+            "The road assistant is temporarily unavailable. "
+            "Please try again later."
         )
 
+
     # --------------------------------------------------------
-    # CREATE CLIENT
+    # Create client
     # --------------------------------------------------------
 
-    client = _create_client(
-        api_key
+    client = genai.Client(
+        api_key=backend_key
     )
 
+
     # --------------------------------------------------------
-    # LOAD CHAT PROMPT
+    # Load chat prompt
     # --------------------------------------------------------
 
-    system_prompt = _load_prompt(
+    system_prompt = load_prompt(
         CHAT_PROMPT_PATH
     )
 
+
     # --------------------------------------------------------
-    # ADD PHOTO ANALYSIS
+    # Add photo analysis
     # --------------------------------------------------------
 
     if analysis:
 
-        try:
-
-            analysis_json = json.dumps(
+        system_prompt += (
+            "\n\n<photo_analysis>\n"
+            + json.dumps(
                 analysis,
                 ensure_ascii=False
             )
-
-        except (TypeError, ValueError):
-
-            analysis_json = "{}"
-
-        system_prompt += (
-            "\n\n"
-            "<photo_analysis>\n"
-            + analysis_json
             + "\n</photo_analysis>"
         )
 
+
     # --------------------------------------------------------
-    # PREPARE HISTORY
+    # Prepare history
     # --------------------------------------------------------
 
     contents = []
 
-    for index, message in enumerate(history):
 
-        if not isinstance(
-            message,
-            dict
-        ):
-            continue
+    for index, message in enumerate(
+        history
+    ):
 
         role = message.get(
             "role",
@@ -404,15 +519,11 @@ def chat_reply(
             ""
         )
 
-        if content is None:
-            content = ""
-
-        content = str(
-            content
-        ).strip()
 
         if not content:
-            continue
+
+            content = "Please continue."
+
 
         parts = [
 
@@ -422,14 +533,19 @@ def chat_reply(
 
         ]
 
+
         # ----------------------------------------------------
         # Attach image only to first user message
         # ----------------------------------------------------
 
         if (
+
             index == 0
+
             and role == "user"
+
             and image_bytes
+
         ):
 
             parts.insert(
@@ -437,39 +553,69 @@ def chat_reply(
                 0,
 
                 types.Part.from_bytes(
+
                     data=image_bytes,
-                    mime_type=mime_type or "image/jpeg"
+
+                    mime_type=mime_type
+
                 )
 
             )
 
+
         gemini_role = (
+
             "user"
+
             if role == "user"
+
             else "model"
+
         )
+
 
         contents.append(
 
             types.Content(
+
                 role=gemini_role,
+
                 parts=parts
+
             )
 
         )
 
+
     # --------------------------------------------------------
-    # SAFETY CHECK
+    # Prevent empty conversation
     # --------------------------------------------------------
 
     if not contents:
 
-        return (
-            "Please enter a road project question."
-        )
+        contents = [
+
+            types.Content(
+
+                role="user",
+
+                parts=[
+
+                    types.Part.from_text(
+                        text=(
+                            "Help me plan this road project."
+                        )
+                    )
+
+                ]
+
+            )
+
+        ]
+
 
     # --------------------------------------------------------
-    # GENERATE CHAT RESPONSE
+    # Send request
     # --------------------------------------------------------
 
     try:
@@ -490,26 +636,31 @@ def chat_reply(
 
         )
 
-    except Exception as error:
+    except Exception:
 
-        # Keep technical/provider information hidden.
-        raise RuntimeError(
-            "The road assistant is temporarily unavailable."
-        ) from error
+        # Never expose API/provider error details.
+
+        return (
+            "The road assistant is temporarily "
+            "unavailable. Please try again later."
+        )
+
 
     # --------------------------------------------------------
-    # RETURN ANSWER
+    # Return response
     # --------------------------------------------------------
 
     answer = (
         response.text or ""
     ).strip()
 
+
     if not answer:
 
         return (
-            "I could not generate a response right now. "
+            "I could not generate a response. "
             "Please try again."
         )
+
 
     return answer
