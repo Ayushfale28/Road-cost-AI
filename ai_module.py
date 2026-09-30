@@ -1,15 +1,34 @@
 """
 AI backend module for the Road Cost Estimator.
 
-This version uses OpenRouter instead of the Gemini SDK.
+Uses OpenRouter (https://openrouter.ai) over plain HTTP -- no extra SDK
+dependency required.
 
-IMPORTANT:
-- API keys are NEVER requested from the website user.
-- The OpenRouter API key is read only from Streamlit Secrets or
-  environment variables.
-- The AI provider is intentionally hidden from the website UI.
-- The default model is OpenRouter's free router, which can select
-  a currently available free model that supports the request.
+Privacy / security:
+    - The end user is NEVER asked for an API key.
+    - The key is read only from Streamlit secrets or an environment
+      variable, inside this module.
+    - The provider name and model name are never surfaced to the user;
+      error messages are always generic.
+
+Model selection:
+    "openrouter/free" is a real OpenRouter router, but it selects a
+    random free model on every request. Some of those models do not
+    support image input or JSON-mode responses, which made photo
+    analysis succeed sometimes and fail other times with no clear
+    reason. To make behaviour predictable, this module instead tries a
+    short, explicit list of known vision-capable free models in order,
+    and falls back to the next one if a call fails.
+
+Three-layer responsibility split (the AI never does arithmetic):
+    1. analyze_photo / analyze_photos  -> understand the site (vision)
+    2. generate_project_specification  -> turn a text description into
+       structured work categories
+    3. select_ssr_items                -> choose from a list of SSR
+       candidates that Python already found by keyword search; the AI
+       can only pick ids from that list, never invent one
+    Quantities and costs are always calculated in quantity_engine.py,
+    never by the AI.
 """
 
 import base64
@@ -19,139 +38,82 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-
-# ============================================================
-# FILE LOCATIONS
-# ============================================================
-
 BASE_DIR = Path(__file__).resolve().parent
-
 PHOTO_PROMPT_PATH = BASE_DIR / "road_photo_prompt.xml"
 CHAT_PROMPT_PATH = BASE_DIR / "chat_prompt.xml"
 
-
-# ============================================================
-# OPENROUTER SETTINGS
-# ============================================================
-
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Can be overridden in Streamlit Secrets:
-# OPENROUTER_MODEL = "some-model-slug"
-#
-# openrouter/free automatically selects a currently available
-# free model and supports text/image requests.
-MODEL = os.getenv(
-    "OPENROUTER_MODEL",
-    "openrouter/free"
-)
+# Ordered list of models to try. Each one is a specific, named model
+# (not the random "openrouter/free" router) that is known to accept
+# image input at the time this was written. Free-tier model
+# availability on OpenRouter changes over time -- if all of these stop
+# working, check https://openrouter.ai/models?fmt=cards&max_price=0
+# and update this list.
+DEFAULT_VISION_MODELS = [
+    "qwen/qwen2.5-vl-72b-instruct:free",
+    "meta-llama/llama-3.2-11b-vision-instruct:free",
+    "google/gemma-3-27b-it:free",
+]
 
-SITE_URL = os.getenv(
-    "OPENROUTER_SITE_URL",
-    ""
-)
+# For text-only chat, any of the vision models above also work fine, so
+# the same list is reused.
+DEFAULT_TEXT_MODELS = DEFAULT_VISION_MODELS
 
-SITE_NAME = os.getenv(
-    "OPENROUTER_SITE_NAME",
-    "Road Cost Estimator"
-)
+_env_models = os.getenv("OPENROUTER_MODELS", "").strip()
+VISION_MODELS = [m.strip() for m in _env_models.split(",") if m.strip()] or DEFAULT_VISION_MODELS
+
+SITE_URL = os.getenv("OPENROUTER_SITE_URL", "")
+SITE_NAME = os.getenv("OPENROUTER_SITE_NAME", "Road Cost Estimator")
 
 
 # ============================================================
-# INTERNAL API KEY
+# API KEY (never exposed to the UI)
 # ============================================================
 
-def get_api_key():
-    """
-    Get the OpenRouter API key from backend configuration.
-
-    Priority:
-    1. Streamlit Secrets
-    2. Environment variable
-
-    The user never enters the key in the UI.
-    """
-
-    # --------------------------------------------------------
-    # Streamlit Secrets
-    # --------------------------------------------------------
-
+def get_api_key() -> str:
     try:
         import streamlit as st
-
-        key = st.secrets.get(
-            "OPENROUTER_API_KEY",
-            ""
-        )
-
+        key = st.secrets.get("OPENROUTER_API_KEY", "")
         if key:
             return str(key).strip()
-
     except Exception:
         pass
 
-    # --------------------------------------------------------
-    # Environment variable
-    # --------------------------------------------------------
+    return os.getenv("OPENROUTER_API_KEY", "").strip()
 
-    key = os.getenv(
-        "OPENROUTER_API_KEY",
-        ""
-    )
 
-    if key:
-        return key.strip()
-
-    return ""
+def ai_is_configured() -> bool:
+    return bool(get_api_key())
 
 
 # ============================================================
-# PROMPT LOADER
+# PROMPT LOADING
 # ============================================================
 
-def load_prompt(file_path: Path) -> str:
-    """
-    Load an XML prompt file.
-    """
-
-    if not file_path.exists():
-        raise FileNotFoundError(
-            f"Required AI prompt file is missing: {file_path.name}"
-        )
-
-    return file_path.read_text(
-        encoding="utf-8"
-    )
+def load_prompt(path: Path) -> str:
+    if not path.exists():
+        raise FileNotFoundError(f"Required AI prompt file is missing: {path.name}")
+    return path.read_text(encoding="utf-8")
 
 
 # ============================================================
-# JSON CLEANER
+# JSON RESPONSE CLEANING / PARSING
 # ============================================================
 
 def clean_json_response(text: str) -> str:
-    """
-    Clean common formatting mistakes from an AI JSON response.
-    """
-
     text = (text or "").strip()
-
     if not text:
         return ""
 
-    # Remove Markdown fences.
     if text.startswith("```json"):
         text = text[len("```json"):].strip()
-
     elif text.startswith("```"):
         text = text[len("```"):].strip()
-
     if text.endswith("```"):
         text = text[:-3].strip()
 
-    # Some models occasionally add text before the JSON object.
-    # Find the first JSON object and parse it from there.
     first_brace = text.find("{")
-
     if first_brace > 0:
         text = text[first_brace:]
 
@@ -159,481 +121,194 @@ def clean_json_response(text: str) -> str:
 
 
 def parse_json_response(text: str) -> dict:
-    """
-    Parse a JSON object robustly.
-
-    This handles:
-    - normal JSON
-    - Markdown fenced JSON
-    - accidental text after the JSON object
-    """
-
     cleaned = clean_json_response(text)
-
     if not cleaned:
-        raise RuntimeError(
-            "AI analysis returned no result."
-        )
+        raise RuntimeError("AI analysis returned no result.")
 
     try:
         result = json.loads(cleaned)
-
     except json.JSONDecodeError:
-        # Try JSONDecoder.raw_decode so trailing text does not
-        # break an otherwise valid JSON object.
         try:
             decoder = json.JSONDecoder()
             result, _ = decoder.raw_decode(cleaned)
-
         except Exception as error:
-            raise RuntimeError(
-                "AI analysis returned an invalid result."
-            ) from error
+            raise RuntimeError("AI analysis returned an invalid result.") from error
 
     if not isinstance(result, dict):
-        raise RuntimeError(
-            "AI analysis returned an unexpected format."
-        )
+        raise RuntimeError("AI analysis returned an unexpected format.")
 
     return result
 
 
 # ============================================================
-# OPENROUTER REQUEST
+# LOW-LEVEL OPENROUTER CALL (single model, single attempt)
 # ============================================================
 
-def _openrouter_request(
-    messages,
-    system_prompt="",
-    temperature=0.2,
-    json_mode=False
-):
-    """
-    Send a request to OpenRouter.
-
-    Uses Python's standard library so no additional HTTP
-    package is required.
-    """
-
+def _call_model(model: str, messages, system_prompt: str, temperature: float, json_mode: bool) -> str:
     api_key = get_api_key()
-
     if not api_key:
-        raise RuntimeError(
-            "AI service is not configured."
-        )
+        raise RuntimeError("AI service is not configured.")
 
     payload_messages = []
-
     if system_prompt:
-        payload_messages.append(
-            {
-                "role": "system",
-                "content": system_prompt
-            }
-        )
-
+        payload_messages.append({"role": "system", "content": system_prompt})
     payload_messages.extend(messages)
 
-    payload = {
-        "model": MODEL,
-        "messages": payload_messages,
-        "temperature": temperature
-    }
-
-    # Ask the model/router for JSON when the photo-analysis
-    # prompt requires JSON.
+    payload = {"model": model, "messages": payload_messages, "temperature": temperature}
     if json_mode:
-        payload["response_format"] = {
-            "type": "json_object"
-        }
+        payload["response_format"] = {"type": "json_object"}
 
-    body = json.dumps(
-        payload,
-        ensure_ascii=False
-    ).encode("utf-8")
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-
-    # Optional OpenRouter attribution headers.
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     if SITE_URL:
         headers["HTTP-Referer"] = SITE_URL
-
     if SITE_NAME:
         headers["X-Title"] = SITE_NAME
 
-    request = urllib.request.Request(
-        OPENROUTER_URL,
-        data=body,
-        headers=headers,
-        method="POST"
-    )
+    request = urllib.request.Request(OPENROUTER_URL, data=body, headers=headers, method="POST")
 
     try:
-        with urllib.request.urlopen(
-            request,
-            timeout=120
-        ) as response:
-
-            raw = response.read().decode(
-                "utf-8",
-                errors="replace"
-            )
-
+        with urllib.request.urlopen(request, timeout=120) as response:
+            raw = response.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as error:
-
-        # Do not expose provider/API details to the user.
-        # Keep details available internally for debugging logs.
         try:
-            error_body = error.read().decode(
-                "utf-8",
-                errors="replace"
-            )
+            error_body = error.read().decode("utf-8", errors="replace")
         except Exception:
             error_body = ""
-
-        print(
-            "OpenRouter HTTP error:",
-            error.code,
-            error_body[:1000]
-        )
-
-        raise RuntimeError(
-            "AI request failed."
-        ) from error
-
+        print(f"OpenRouter HTTP error ({model}):", error.code, error_body[:800])
+        raise RuntimeError("AI request failed.") from error
     except Exception as error:
-
-        print(
-            "OpenRouter connection error:",
-            repr(error)
-        )
-
-        raise RuntimeError(
-            "AI request failed."
-        ) from error
+        print(f"OpenRouter connection error ({model}):", repr(error))
+        raise RuntimeError("AI request failed.") from error
 
     try:
         data = json.loads(raw)
-
     except json.JSONDecodeError as error:
+        print("OpenRouter returned invalid JSON:", raw[:500])
+        raise RuntimeError("AI request returned an invalid response.") from error
 
-        print(
-            "OpenRouter returned invalid JSON:",
-            raw[:1000]
-        )
-
-        raise RuntimeError(
-            "AI request returned an invalid response."
-        ) from error
-
-    # OpenRouter normally returns:
-    # choices[0].message.content
     try:
         content = data["choices"][0]["message"]["content"]
-
     except (KeyError, IndexError, TypeError) as error:
+        print("Unexpected OpenRouter response shape:", str(data)[:800])
+        raise RuntimeError("AI request returned an unexpected response.") from error
 
-        print(
-            "Unexpected OpenRouter response:",
-            str(data)[:1500]
-        )
-
-        raise RuntimeError(
-            "AI request returned an unexpected response."
-        ) from error
-
-    # Some providers can return structured content in a list.
     if isinstance(content, list):
-
-        text_parts = []
-
+        parts = []
         for part in content:
-
             if isinstance(part, dict):
-
-                if part.get("type") == "text":
-                    text_parts.append(
-                        str(part.get("text", ""))
-                    )
-
-                elif "text" in part:
-                    text_parts.append(
-                        str(part["text"])
-                    )
-
+                parts.append(str(part.get("text", "")))
             elif isinstance(part, str):
-                text_parts.append(part)
+                parts.append(part)
+        content = "\n".join(parts)
 
-        content = "\n".join(
-            text_parts
-        )
+    return str(content).strip()
 
-    if not isinstance(content, str):
-        content = str(content)
 
-    return content.strip()
+def _request_with_fallback(messages, system_prompt: str, temperature: float, json_mode: bool,
+                            models=None) -> str:
+    """
+    Try each model in order. For each model, try with json_mode first
+    (if requested) and retry once without it, since some free models
+    reject the response_format parameter outright rather than ignoring
+    it.
+    """
+    models = models or VISION_MODELS
+    last_error = None
+
+    for model in models:
+        attempts = [json_mode, False] if json_mode else [False]
+        for attempt_json_mode in dict.fromkeys(attempts):  # de-dupe while keeping order
+            try:
+                return _call_model(model, messages, system_prompt, temperature, attempt_json_mode)
+            except Exception as error:
+                last_error = error
+                continue
+
+    raise last_error or RuntimeError("AI request failed.")
 
 
 # ============================================================
-# IMAGE DATA URL
+# IMAGE ENCODING
 # ============================================================
 
-def _image_to_data_url(
-    image_bytes: bytes,
-    mime_type: str
-) -> str:
-    """
-    Convert uploaded image bytes to a base64 data URL.
-
-    OpenRouter accepts base64 image data in image_url content.
-    """
-
+def _image_to_data_url(image_bytes: bytes, mime_type: str) -> str:
     if not image_bytes:
-        raise ValueError(
-            "No image data was provided."
-        )
+        raise ValueError("No image data was provided.")
 
-    safe_mime = (
-        mime_type
-        or "image/jpeg"
-    ).lower().strip()
-
-    # Keep only known image MIME types.
-    allowed = {
-        "image/jpeg",
-        "image/jpg",
-        "image/png",
-        "image/webp",
-        "image/gif"
-    }
-
-    if safe_mime not in allowed:
+    safe_mime = (mime_type or "image/jpeg").lower().strip()
+    if safe_mime not in {"image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"}:
         safe_mime = "image/jpeg"
 
-    encoded = base64.b64encode(
-        image_bytes
-    ).decode("utf-8")
-
-    return (
-        f"data:{safe_mime};base64,{encoded}"
-    )
+    encoded = base64.b64encode(image_bytes).decode("utf-8")
+    return f"data:{safe_mime};base64,{encoded}"
 
 
 # ============================================================
 # PHOTO ANALYSIS
 # ============================================================
 
-def analyze_photo(
-    image_bytes: bytes,
-    mime_type: str,
-    api_key: str | None = None,
-    note: str = ""
-) -> dict:
-    """
-    Analyze one road photograph.
-
-    The api_key argument is retained only for compatibility
-    with existing app.py versions. It is intentionally ignored.
-
-    The actual key always comes from Streamlit Secrets or
-    the server environment.
-    """
-
+def analyze_photo(image_bytes: bytes, mime_type: str, note: str = "") -> dict:
+    """Analyze one road/site photograph. Raises on failure (caller decides the fallback)."""
     if not image_bytes:
-        raise ValueError(
-            "No image data was provided."
-        )
+        raise ValueError("No image data was provided.")
 
-    # --------------------------------------------------------
-    # Load prompt
-    # --------------------------------------------------------
+    system_prompt = load_prompt(PHOTO_PROMPT_PATH)
 
-    system_prompt = load_prompt(
-        PHOTO_PROMPT_PATH
-    )
-
-    # --------------------------------------------------------
-    # User instruction
-    # --------------------------------------------------------
-
-    user_text = (
-        "Analyse this road/site photograph according "
-        "to the instructions provided. "
-        "Return ONLY the required JSON object."
-    )
-
+    user_text = "Analyse this road/site photograph according to the instructions provided. Return ONLY the required JSON object."
     if note and note.strip():
-        user_text += (
-            "\n\nEngineer's additional note: "
-            + note.strip()
-        )
+        user_text += f"\n\nEngineer's additional note: {note.strip()}"
 
-    # --------------------------------------------------------
-    # Image message
-    # --------------------------------------------------------
+    image_url = _image_to_data_url(image_bytes, mime_type)
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": user_text},
+            {"type": "image_url", "image_url": {"url": image_url}},
+        ],
+    }]
 
-    image_url = _image_to_data_url(
-        image_bytes,
-        mime_type
-    )
-
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": user_text
-                },
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": image_url
-                    }
-                }
-            ]
-        }
-    ]
-
-    # --------------------------------------------------------
-    # OpenRouter request
-    # --------------------------------------------------------
-
-    text = _openrouter_request(
-        messages=messages,
-        system_prompt=system_prompt,
-        temperature=0.2,
-        json_mode=True
-    )
-
-    # --------------------------------------------------------
-    # Parse JSON
-    # --------------------------------------------------------
-
-    return parse_json_response(
-        text
-    )
+    text = _request_with_fallback(messages, system_prompt, temperature=0.2, json_mode=True)
+    return parse_json_response(text)
 
 
-# ============================================================
-# MULTI-PHOTO ANALYSIS
-# ============================================================
-
-def analyze_photos(
-    photos: list,
-    note: str = ""
-) -> list:
-    """
-    Analyze multiple uploaded photos.
-
-    Expected photo format:
-
-    {
-        "name": "...",
-        "bytes": b"...",
-        "mime": "image/jpeg"
+def _unavailable_result(reason: str) -> dict:
+    """A result with the exact schema analyze_photo produces on success,
+    so the UI never has to special-case a failure shape."""
+    return {
+        "photo_quality": {"value": "poor", "reason": "analysis unavailable"},
+        "site_type": {"value": "unclear", "confidence": "low"},
+        "recommended_mode": {"value": "unclear", "confidence": "low", "reason": reason},
+        "new_road_notes": {
+            "terrain": "not_visible",
+            "drainage_concerns": "uncertain",
+            "obstacles": [],
+            "cc_vs_bt_factors": "Manual engineering assessment required.",
+        },
+        "road_type": {"value": "unclear", "confidence": "low"},
+        "surface_condition": "Automatic analysis was unavailable.",
+        "defects": [],
+        "suggested_works": [],
+        "suggested_parameters": [],
+        "limitations": "Automatic photo analysis was unavailable. Manual site review is required.",
     }
 
-    Returns:
 
-    [
-        {
-            "name": "...",
-            "result": {...}
-        }
-    ]
+def analyze_photos(photos: list, note: str = "") -> list:
     """
-
+    Analyze multiple photos. Each item: {"name": str, "bytes": bytes, "mime": str}.
+    Returns [{"name": str, "result": dict}, ...] -- every result dict has
+    the same schema whether analysis succeeded or not.
+    """
     results = []
-
     for photo in photos:
-
-        name = photo.get(
-            "name",
-            "Photo"
-        )
-
-        image_bytes = photo.get(
-            "bytes"
-        )
-
-        mime_type = photo.get(
-            "mime",
-            "image/jpeg"
-        )
-
+        name = photo.get("name", "Photo")
         try:
-
-            result = analyze_photo(
-                image_bytes=image_bytes,
-                mime_type=mime_type,
-                note=note
-            )
-
-            results.append(
-                {
-                    "name": name,
-                    "result": result
-                }
-            )
-
+            result = analyze_photo(photo.get("bytes"), photo.get("mime", "image/jpeg"), note)
         except Exception as error:
-
-            # Keep provider/API details out of the website.
-            print(
-                f"Photo analysis failed for {name}:",
-                repr(error)
-            )
-
-            results.append(
-                {
-                    "name": name,
-                    "result": {
-                        "photo_quality": (
-                            "poor - analysis unavailable"
-                        ),
-                        "site_type": {
-                            "value": "unclear",
-                            "confidence": "low"
-                        },
-                        "recommended_mode": {
-                            "value": "unclear",
-                            "confidence": "low",
-                            "reason": (
-                                "Photo could not be "
-                                "automatically analysed."
-                            )
-                        },
-                        "new_road_notes": {
-                            "terrain": "not visible",
-                            "drainage_concerns": "uncertain",
-                            "obstacles": "uncertain",
-                            "cc_vs_bt_factors": (
-                                "Manual engineering assessment required."
-                            )
-                        },
-                        "road_type": {
-                            "value": "unclear",
-                            "confidence": "low"
-                        },
-                        "surface_condition": (
-                            "Automatic analysis was unavailable."
-                        ),
-                        "defects": [],
-                        "suggested_works": [],
-                        "suggested_parameters": [],
-                        "limitations": (
-                            "Automatic photo analysis "
-                            "was unavailable. Manual site "
-                            "review is required."
-                        )
-                    }
-                }
-            )
-
+            print(f"Photo analysis failed for {name}:", repr(error))
+            result = _unavailable_result("Photo could not be automatically analysed.")
+        results.append({"name": name, "result": result})
     return results
 
 
@@ -641,254 +316,67 @@ def analyze_photos(
 # CHAT ASSISTANT
 # ============================================================
 
-def chat_reply(
-    history: list,
-    api_key: str | None = None,
-    analysis: dict | None = None,
-    image_bytes: bytes | None = None,
-    mime_type: str = "image/jpeg"
-) -> str:
-    """
-    Generate a response from the road project assistant.
-
-    The api_key argument is retained for compatibility with
-    existing app.py versions but is intentionally ignored.
-
-    The actual key always comes from backend configuration.
-    """
-
+def chat_reply(history: list, analysis: dict | None = None,
+               image_bytes: bytes | None = None, mime_type: str = "image/jpeg") -> str:
     try:
-
-        # ----------------------------------------------------
-        # Load chat prompt
-        # ----------------------------------------------------
-
-        system_prompt = load_prompt(
-            CHAT_PROMPT_PATH
-        )
-
-        # ----------------------------------------------------
-        # Add photo analysis context
-        # ----------------------------------------------------
-
+        system_prompt = load_prompt(CHAT_PROMPT_PATH)
         if analysis:
-
-            system_prompt += (
-                "\n\n<photo_analysis>\n"
-                + json.dumps(
-                    analysis,
-                    ensure_ascii=False
-                )
-                + "\n</photo_analysis>"
-            )
-
-        # ----------------------------------------------------
-        # Prepare conversation history
-        # ----------------------------------------------------
+            system_prompt += "\n\n<photo_analysis>\n" + json.dumps(analysis, ensure_ascii=False) + "\n</photo_analysis>"
 
         messages = []
+        for index, message in enumerate(history or []):
+            role = "assistant" if message.get("role") == "assistant" else "user"
+            content = message.get("content") or "Please continue."
 
-        for index, message in enumerate(
-            history or []
-        ):
-
-            role = message.get(
-                "role",
-                "user"
-            )
-
-            content = message.get(
-                "content",
-                ""
-            )
-
-            if not content:
-                content = "Please continue."
-
-            # Streamlit uses "assistant"; OpenRouter expects
-            # "assistant" as well.
-            openrouter_role = (
-                "assistant"
-                if role == "assistant"
-                else "user"
-            )
-
-            # ------------------------------------------------
-            # Attach image only to the first user message
-            # ------------------------------------------------
-
-            if (
-                index == 0
-                and openrouter_role == "user"
-                and image_bytes
-            ):
-
-                image_url = _image_to_data_url(
-                    image_bytes,
-                    mime_type
-                )
-
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": content
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": image_url
-                                }
-                            }
-                        ]
-                    }
-                )
-
+            if index == 0 and role == "user" and image_bytes:
+                image_url = _image_to_data_url(image_bytes, mime_type)
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": content},
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                    ],
+                })
             else:
-
-                messages.append(
-                    {
-                        "role": openrouter_role,
-                        "content": content
-                    }
-                )
-
-        # ----------------------------------------------------
-        # Prevent empty conversation
-        # ----------------------------------------------------
+                messages.append({"role": role, "content": content})
 
         if not messages:
+            messages = [{"role": "user", "content": "Help me plan this road project."}]
 
-            if image_bytes:
-
-                image_url = _image_to_data_url(
-                    image_bytes,
-                    mime_type
-                )
-
-                messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": (
-                                    "Help me plan this "
-                                    "road project."
-                                )
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": image_url
-                                }
-                            }
-                        ]
-                    }
-                ]
-
-            else:
-
-                messages = [
-                    {
-                        "role": "user",
-                        "content": (
-                            "Help me plan this "
-                            "road project."
-                        )
-                    }
-                ]
-
-        # ----------------------------------------------------
-        # Send request
-        # ----------------------------------------------------
-
-        answer = _openrouter_request(
-            messages=messages,
-            system_prompt=system_prompt,
-            temperature=0.5,
-            json_mode=False
-        )
-
-        if not answer:
-
-            return (
-                "I could not generate a response. "
-                "Please try again."
-            )
-
-        return answer
+        answer = _request_with_fallback(messages, system_prompt, temperature=0.5,
+                                         json_mode=False, models=DEFAULT_TEXT_MODELS)
+        return answer or "I could not generate a response. Please try again."
 
     except Exception as error:
+        print("Chat assistant error:", repr(error))
+        return "The road assistant is temporarily unavailable. Please try again later."
 
-        # Never expose API/provider details to the user.
-        print(
-            "Chat assistant error:",
-            repr(error)
-        )
 
-        return (
-            "The road assistant is temporarily "
-            "unavailable. Please try again later."
-        )
-      # ============================================================
-# AI PROJECT SPECIFICATION
+# ============================================================
+# PROJECT SPECIFICATION (natural-language project description -> work categories)
 # ============================================================
 
-def generate_project_specification(
-    mode,
-    road_type,
-    length_m,
-    width_m,
-    thickness_mm,
-    soil_condition="",
-    traffic_type="",
-    drainage_required="",
-    lead_distance_km=0.0,
-    additional_prompt="",
-    photo_analysis=None
-):
-    """
-    Convert the user's project information into a structured
-    engineering/project specification.
+_SPEC_SYSTEM_PROMPT = """You are an AI road estimation planning assistant.
 
-    The AI does NOT provide SSR rates or invent SSR item numbers.
+Your job is to understand a road construction or repair project and
+identify the types of work that may be required.
 
-    It only identifies:
-        - project type
-        - road type
-        - required work categories
-        - relevant keywords
-        - engineering information
-
-    The actual SSR items and rates must come from the SSR database.
-    """
-
-    system_prompt = """
-You are an AI road estimation planning assistant.
-
-Your job is to understand a road construction or repair project
-and identify the types of work that may be required.
-
-IMPORTANT RULES:
-
+RULES:
 1. Never invent SSR item numbers.
 2. Never invent SSR rates.
 3. Never invent quantities.
 4. Do not provide a final cost.
-5. SSR items and rates will be obtained from the application's
-   actual SSR database.
-6. Measurements supplied by the user must be preserved exactly.
-7. Identify relevant construction/repair work categories.
-8. Return ONLY valid JSON.
-
-The final estimate will be calculated by the application's
-engineering calculation engine.
+5. Measurements supplied by the user must be preserved exactly, never changed.
+6. Only recommend work categories reasonably supported by the given information.
+7. Return ONLY valid JSON, matching the schema you are given.
 """
 
-    project_information = {
+
+def generate_project_specification(mode, road_type, length_m, width_m, thickness_mm,
+                                    soil_condition="", traffic_type="", drainage_required="",
+                                    lead_distance_km=0.0, additional_prompt="",
+                                    photo_analysis=None) -> dict:
+    project_info = {
         "mode": mode,
         "road_type": road_type,
         "length_m": length_m,
@@ -898,189 +386,106 @@ engineering calculation engine.
         "traffic_type": traffic_type,
         "drainage_required": drainage_required,
         "lead_distance_km": lead_distance_km,
-        "additional_prompt": additional_prompt
+        "additional_prompt": additional_prompt,
     }
-
     if photo_analysis:
+        project_info["photo_analysis"] = photo_analysis
 
-        project_information[
-            "photo_analysis"
-        ] = photo_analysis
-
-    user_prompt = f"""
-Analyse the following road project.
+    user_prompt = f"""Analyse this road project and identify relevant work categories
+(for example: site preparation, excavation, subgrade, sub-base, base
+course, concrete pavement, bituminous pavement, joints, drainage, road
+furniture, road safety, maintenance, pothole repair). Only recommend
+categories reasonably supported by the information below -- do not
+assume every category applies.
 
 PROJECT INFORMATION:
+{json.dumps(project_info, ensure_ascii=False, indent=2)}
 
-{json.dumps(
-    project_information,
-    ensure_ascii=False,
-    indent=2
-)}
-
-Identify the work categories that should be considered
-for this project.
-
-For example, depending on the project:
-
-- site preparation
-- cleaning
-- excavation
-- subgrade
-- sub-base
-- base course
-- concrete pavement
-- bituminous pavement
-- joints
-- drainage
-- road furniture
-- road safety
-- maintenance
-- pothole repair
-
-Do NOT assume that every category is required.
-
-Only recommend categories that are reasonably supported
-by the project information.
-
-Return this JSON:
-
+Return exactly this JSON shape:
 {{
-    "project_type": "",
-    "road_type": "",
-    "work_categories": [
-        {{
-            "category": "",
-            "reason": "",
-            "search_keywords": []
-        }}
-    ],
-    "additional_requirements": [],
-    "missing_information": []
-}}
-"""
+  "project_type": "",
+  "road_type": "",
+  "work_categories": [
+    {{"category": "", "reason": "", "search_keywords": []}}
+  ],
+  "additional_requirements": [],
+  "missing_information": []
+}}"""
 
-    messages = [
-        {
-            "role": "user",
-            "content": user_prompt
-        }
-    ]
-
-    response = _openrouter_request(
-        messages=messages,
-        system_prompt=system_prompt,
+    text = _request_with_fallback(
+        [{"role": "user", "content": user_prompt}],
+        system_prompt=_SPEC_SYSTEM_PROMPT,
         temperature=0.1,
-        json_mode=True
+        json_mode=True,
     )
-
-    return parse_json_response(
-        response
-    )
+    return parse_json_response(text)
 
 
 # ============================================================
-# AI SSR ITEM REVIEW
+# SSR CANDIDATE SELECTION (AI picks from a list Python already found)
 # ============================================================
 
-def review_ssr_candidates(
-    project_specification,
-    candidate_items
-):
-    """
-    Ask the generative AI to review SSR candidates.
+_SELECTOR_SYSTEM_PROMPT = """You are an SSR item selection assistant for a road estimation application.
 
-    IMPORTANT:
-    The AI can only choose from the candidates supplied by
-    the application.
-
-    It cannot create new SSR items or rates.
-    """
-
-    if not candidate_items:
-
-        return []
-
-    system_prompt = """
-You are an SSR item selection assistant for a road
-estimation application.
-
-You will receive:
-
-1. A structured road project specification.
-2. A list of actual SSR items from the application's
-   SSR database.
-
-Your task is to identify which supplied SSR items
-are relevant to the project.
+You will receive a project specification and a list of SSR items that
+were already retrieved from the application's real SSR database.
 
 STRICT RULES:
-
-- You may ONLY select items from the supplied list.
-- Never invent an item number.
-- Never invent an SSR rate.
-- Never change the SSR description.
-- Never create an item that is not supplied.
-- Do not calculate quantities.
-- Do not calculate costs.
-- Select only items reasonably required for the project.
-- If an item is uncertain, do not select it.
-
-Return ONLY valid JSON.
+- You may ONLY select ids from the supplied candidate list.
+- Never invent an item, an item number, a rate, or a description.
+- Do not calculate quantities or costs.
+- Select only items reasonably required for this project; if uncertain
+  about an item, leave it out.
+- Return ONLY valid JSON, matching the schema you are given.
 """
 
-    user_prompt = f"""
-PROJECT SPECIFICATION:
 
-{json.dumps(
-    project_specification,
-    ensure_ascii=False,
-    indent=2
-)}
+def select_ssr_items(project_specification: dict, candidate_items: list) -> dict:
+    """
+    Ask the AI to pick the relevant subset of `candidate_items` (a list
+    of small dicts, e.g. from ssr_selector.candidates_to_ai_payload).
 
-AVAILABLE SSR ITEMS:
+    Returns {"selected_ids": [...], "reasons": {id: reason}}. Raises on
+    failure -- the caller should fall back to using the candidates
+    directly (e.g. the top-scored ones) when this is unavailable.
+    """
+    if not candidate_items:
+        return {"selected_ids": [], "reasons": {}}
 
-{json.dumps(
-    candidate_items,
-    ensure_ascii=False,
-    indent=2
-)}
+    user_prompt = f"""PROJECT SPECIFICATION:
+{json.dumps(project_specification, ensure_ascii=False, indent=2)}
 
-Return:
+CANDIDATE SSR ITEMS (only these may be selected):
+{json.dumps(candidate_items, ensure_ascii=False, indent=2)}
 
+Return exactly this JSON shape:
 {{
-    "selected_items": [
-        {{
-            "id": "",
-            "reason": "",
-            "confidence": "low | medium | high"
-        }}
-    ],
-    "excluded_items": [
-        {{
-            "id": "",
-            "reason": ""
-        }}
-    ]
-}}
-"""
+  "selected_items": [
+    {{"id": 0, "reason": "", "confidence": "low | medium | high"}}
+  ]
+}}"""
 
-    messages = [
-        {
-            "role": "user",
-            "content": user_prompt
-        }
-    ]
-
-    response = _openrouter_request(
-        messages=messages,
-        system_prompt=system_prompt,
+    text = _request_with_fallback(
+        [{"role": "user", "content": user_prompt}],
+        system_prompt=_SELECTOR_SYSTEM_PROMPT,
         temperature=0.1,
-        json_mode=True
+        json_mode=True,
     )
+    result = parse_json_response(text)
 
-    result = parse_json_response(
-        response
-    )
+    valid_ids = {c["id"] for c in candidate_items}
+    selected_ids = []
+    reasons = {}
+    for item in result.get("selected_items", []) or []:
+        if not isinstance(item, dict):
+            continue
+        item_id = item.get("id")
+        try:
+            item_id = int(item_id)
+        except (TypeError, ValueError):
+            continue
+        if item_id in valid_ids:
+            selected_ids.append(item_id)
+            reasons[item_id] = item.get("reason", "")
 
-    return result
+    return {"selected_ids": selected_ids, "reasons": reasons}
