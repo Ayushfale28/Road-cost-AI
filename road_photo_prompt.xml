@@ -361,44 +361,6 @@
   </parameters_to_measure>
 
 
-  <ai_estimation_workflow>
-
-    The AI should follow this conceptual workflow:
-
-    STEP 1:
-    Analyze the uploaded photograph.
-
-    STEP 2:
-    Identify the visible site type and road type.
-
-    STEP 3:
-    Identify visible defects and site conditions.
-
-    STEP 4:
-    Recommend repair, new construction or unclear.
-
-    STEP 5:
-    Identify the information that must be obtained from the user.
-
-    STEP 6:
-    If the user later provides project measurements and road construction
-    preferences, those values may be used by the separate SSR estimation
-    engine.
-
-    STEP 7:
-    The SSR estimation engine should search the actual uploaded SSR database
-    rather than inventing an item.
-
-    STEP 8:
-    The user must be able to review the suggested SSR items before finalizing
-    the estimate.
-
-    STEP 9:
-    The final estimate must use the actual SSR rate stored in the SSR database.
-
-  </ai_estimation_workflow>
-
-
   <confidence_rules>
 
     Use only:
