@@ -1,34 +1,21 @@
 """
 AI backend module for the Road Cost Estimator.
 
-Uses OpenRouter (https://openrouter.ai) over plain HTTP -- no extra SDK
-dependency required.
+Uses OpenRouter over plain HTTP -- no extra SDK dependency required.
 
-Privacy / security:
-    - The end user is NEVER asked for an API key.
-    - The key is read only from Streamlit secrets or an environment
-      variable, inside this module.
-    - The provider name and model name are never surfaced to the user;
-      error messages are always generic.
+Privacy: the end user is NEVER asked for an API key. The key is read
+only from Streamlit secrets or an environment variable. The provider
+name and model name are never surfaced to the user; error messages are
+always generic.
 
-Model selection:
-    "openrouter/free" is a real OpenRouter router, but it selects a
-    random free model on every request. Some of those models do not
-    support image input or JSON-mode responses, which made photo
-    analysis succeed sometimes and fail other times with no clear
-    reason. To make behaviour predictable, this module instead tries a
-    short, explicit list of known vision-capable free models in order,
-    and falls back to the next one if a call fails.
+Model selection: "openrouter/free" is a real OpenRouter router, but it
+picks a random free model on every request, and some of those models do
+not support image input or JSON-mode responses. This module instead
+tries a short, explicit list of known vision-capable free models in
+order, falling back to the next one if a call fails.
 
-Three-layer responsibility split (the AI never does arithmetic):
-    1. analyze_photo / analyze_photos  -> understand the site (vision)
-    2. generate_project_specification  -> turn a text description into
-       structured work categories
-    3. select_ssr_items                -> choose from a list of SSR
-       candidates that Python already found by keyword search; the AI
-       can only pick ids from that list, never invent one
-    Quantities and costs are always calculated in quantity_engine.py,
-    never by the AI.
+The AI never does arithmetic: quantities and costs are always
+calculated in quantity_engine.py.
 """
 
 import base64
@@ -44,20 +31,15 @@ CHAT_PROMPT_PATH = BASE_DIR / "chat_prompt.xml"
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Ordered list of models to try. Each one is a specific, named model
-# (not the random "openrouter/free" router) that is known to accept
-# image input at the time this was written. Free-tier model
-# availability on OpenRouter changes over time -- if all of these stop
-# working, check https://openrouter.ai/models?fmt=cards&max_price=0
-# and update this list.
+# Specific, named free models known to accept image input at the time
+# this was written. Free-tier availability on OpenRouter changes over
+# time -- if all of these stop working, check
+# https://openrouter.ai/models?fmt=cards&max_price=0 and update this list.
 DEFAULT_VISION_MODELS = [
     "qwen/qwen2.5-vl-72b-instruct:free",
     "meta-llama/llama-3.2-11b-vision-instruct:free",
     "google/gemma-3-27b-it:free",
 ]
-
-# For text-only chat, any of the vision models above also work fine, so
-# the same list is reused.
 DEFAULT_TEXT_MODELS = DEFAULT_VISION_MODELS
 
 _env_models = os.getenv("OPENROUTER_MODELS", "").strip()
@@ -66,10 +48,6 @@ VISION_MODELS = [m.strip() for m in _env_models.split(",") if m.strip()] or DEFA
 SITE_URL = os.getenv("OPENROUTER_SITE_URL", "")
 SITE_NAME = os.getenv("OPENROUTER_SITE_NAME", "Road Cost Estimator")
 
-
-# ============================================================
-# API KEY (never exposed to the UI)
-# ============================================================
 
 def get_api_key() -> str:
     try:
@@ -87,19 +65,11 @@ def ai_is_configured() -> bool:
     return bool(get_api_key())
 
 
-# ============================================================
-# PROMPT LOADING
-# ============================================================
-
 def load_prompt(path: Path) -> str:
     if not path.exists():
         raise FileNotFoundError(f"Required AI prompt file is missing: {path.name}")
     return path.read_text(encoding="utf-8")
 
-
-# ============================================================
-# JSON RESPONSE CLEANING / PARSING
-# ============================================================
 
 def clean_json_response(text: str) -> str:
     text = (text or "").strip()
@@ -139,10 +109,6 @@ def parse_json_response(text: str) -> dict:
 
     return result
 
-
-# ============================================================
-# LOW-LEVEL OPENROUTER CALL (single model, single attempt)
-# ============================================================
 
 def _call_model(model: str, messages, system_prompt: str, temperature: float, json_mode: bool) -> str:
     api_key = get_api_key()
@@ -210,15 +176,14 @@ def _request_with_fallback(messages, system_prompt: str, temperature: float, jso
     """
     Try each model in order. For each model, try with json_mode first
     (if requested) and retry once without it, since some free models
-    reject the response_format parameter outright rather than ignoring
-    it.
+    reject the response_format parameter outright.
     """
     models = models or VISION_MODELS
     last_error = None
 
     for model in models:
         attempts = [json_mode, False] if json_mode else [False]
-        for attempt_json_mode in dict.fromkeys(attempts):  # de-dupe while keeping order
+        for attempt_json_mode in dict.fromkeys(attempts):
             try:
                 return _call_model(model, messages, system_prompt, temperature, attempt_json_mode)
             except Exception as error:
@@ -227,10 +192,6 @@ def _request_with_fallback(messages, system_prompt: str, temperature: float, jso
 
     raise last_error or RuntimeError("AI request failed.")
 
-
-# ============================================================
-# IMAGE ENCODING
-# ============================================================
 
 def _image_to_data_url(image_bytes: bytes, mime_type: str) -> str:
     if not image_bytes:
@@ -244,10 +205,6 @@ def _image_to_data_url(image_bytes: bytes, mime_type: str) -> str:
     return f"data:{safe_mime};base64,{encoded}"
 
 
-# ============================================================
-# PHOTO ANALYSIS
-# ============================================================
-
 def analyze_photo(image_bytes: bytes, mime_type: str, note: str = "") -> dict:
     """Analyze one road/site photograph. Raises on failure (caller decides the fallback)."""
     if not image_bytes:
@@ -255,7 +212,8 @@ def analyze_photo(image_bytes: bytes, mime_type: str, note: str = "") -> dict:
 
     system_prompt = load_prompt(PHOTO_PROMPT_PATH)
 
-    user_text = "Analyse this road/site photograph according to the instructions provided. Return ONLY the required JSON object."
+    user_text = ("Analyse this road/site photograph according to the instructions "
+                 "provided. Return ONLY the required JSON object.")
     if note and note.strip():
         user_text += f"\n\nEngineer's additional note: {note.strip()}"
 
@@ -312,10 +270,6 @@ def analyze_photos(photos: list, note: str = "") -> list:
     return results
 
 
-# ============================================================
-# CHAT ASSISTANT
-# ============================================================
-
 def chat_reply(history: list, analysis: dict | None = None,
                image_bytes: bytes | None = None, mime_type: str = "image/jpeg") -> str:
     try:
@@ -351,10 +305,6 @@ def chat_reply(history: list, analysis: dict | None = None,
         print("Chat assistant error:", repr(error))
         return "The road assistant is temporarily unavailable. Please try again later."
 
-
-# ============================================================
-# PROJECT SPECIFICATION (natural-language project description -> work categories)
-# ============================================================
 
 _SPEC_SYSTEM_PROMPT = """You are an AI road estimation planning assistant.
 
@@ -395,8 +345,7 @@ def generate_project_specification(mode, road_type, length_m, width_m, thickness
 (for example: site preparation, excavation, subgrade, sub-base, base
 course, concrete pavement, bituminous pavement, joints, drainage, road
 furniture, road safety, maintenance, pothole repair). Only recommend
-categories reasonably supported by the information below -- do not
-assume every category applies.
+categories reasonably supported by the information below.
 
 PROJECT INFORMATION:
 {json.dumps(project_info, ensure_ascii=False, indent=2)}
@@ -421,10 +370,6 @@ Return exactly this JSON shape:
     return parse_json_response(text)
 
 
-# ============================================================
-# SSR CANDIDATE SELECTION (AI picks from a list Python already found)
-# ============================================================
-
 _SELECTOR_SYSTEM_PROMPT = """You are an SSR item selection assistant for a road estimation application.
 
 You will receive a project specification and a list of SSR items that
@@ -442,12 +387,10 @@ STRICT RULES:
 
 def select_ssr_items(project_specification: dict, candidate_items: list) -> dict:
     """
-    Ask the AI to pick the relevant subset of `candidate_items` (a list
-    of small dicts, e.g. from ssr_selector.candidates_to_ai_payload).
-
+    Ask the AI to pick the relevant subset of candidate_items.
     Returns {"selected_ids": [...], "reasons": {id: reason}}. Raises on
     failure -- the caller should fall back to using the candidates
-    directly (e.g. the top-scored ones) when this is unavailable.
+    directly when this is unavailable.
     """
     if not candidate_items:
         return {"selected_ids": [], "reasons": {}}
