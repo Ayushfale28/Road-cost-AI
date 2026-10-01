@@ -150,6 +150,13 @@ def find_candidates(
     if df is None or df.empty:
         return pd.DataFrame()
 
+    # The caller's DataFrame may have its index set to the "id" column
+    # (app.py does this for fast .loc lookups elsewhere). That makes the
+    # index name and a column both called "id", which pandas treats as
+    # ambiguous during merge(on="id") below. Resetting to a plain
+    # RangeIndex here avoids that without affecting the caller's copy.
+    df = df.reset_index(drop=True)
+
     pool = df
     if allowed_chapters:
         allowed_norm = {_norm(c) for c in allowed_chapters}
