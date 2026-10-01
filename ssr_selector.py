@@ -1,10 +1,23 @@
 """
 SSR item candidate search and selection.
 
-Flow: Python keyword scoring finds a broad candidate list -> AI (if
-available) picks the relevant subset from those candidates only, with a
-reason -> user reviews. The AI can never invent an item; it can only
-choose ids from the candidate list it was given.
+Design (the "hybrid" approach):
+
+    Python keyword scoring  -->  broad list of candidates (does not miss
+                                  items just because they don't fit a
+                                  predefined category)
+              |
+              v
+    AI review (optional)    -->  picks the relevant subset from those
+                                  candidates only, with a reason
+              |
+              v
+    User review in the UI   -->  final say
+
+The AI is never allowed to invent an item; it can only choose ids from
+the candidate list it was given. If the AI step is unavailable (no key,
+network error, bad response), the top-scored candidates are used
+directly so the feature still works without AI.
 """
 
 import re
@@ -26,9 +39,10 @@ NEW_ROAD_KEYWORDS = ["excavat", "earthwork", "sub grade", "subgrade", "sub base"
 REPAIR_KEYWORDS = ["maintenance", "repair", "pothole", "patch", "crack", "ravel", "edge break",
                     "reinstatement"]
 
-# Categories used only to spread the selection across different kinds of
-# work rather than picking 10 near-duplicate rows -- NOT used to drop
-# anything. A row that matches none of these can still be selected.
+# Categories used only to make sure the selector spreads across different
+# kinds of work rather than picking 10 near-duplicate rows -- NOT used to
+# drop anything. Every category, including items that match none of
+# these, can still be selected if its score is positive.
 CATEGORY_KEYWORDS = {
     "site_preparation": ["clearing", "cleaning", "grubbing"],
     "excavation": ["excavat", "earthwork", "cutting"],
@@ -90,6 +104,8 @@ def score_item(row, mode: str, road_kind: str, ai_analysis: dict | None) -> tupl
             score += 10 * hits
             reasons.append("matches repair/maintenance work")
 
+    # Bonus from the AI's photo analysis, if available: detected defects
+    # and suggested-work keywords give extra weight to matching rows.
     if ai_analysis:
         for defect in ai_analysis.get("defects", []) or []:
             if isinstance(defect, dict):
@@ -121,13 +137,15 @@ def find_candidates(
 ) -> pd.DataFrame:
     """
     Score SSR rows and return the strongest candidates, spread across
-    categories (including "other").
+    categories (including "other" -- nothing is discarded purely for not
+    matching a predefined category).
 
-    allowed_chapters restricts scoring to a specific chapter group.
-    This matters because road-agnostic keywords such as "crack" or
-    "patch" also appear in unrelated chapters like Bridge Maintenance or
-    Waterproofing -- without this restriction those unrelated items
-    could be scored and selected by mistake.
+    allowed_chapters restricts scoring to a specific set of chapters
+    (typically the road-related chapter group for the chosen mode/road
+    type). This matters because road-agnostic keywords such as "crack"
+    or "patch" also appear in unrelated chapters like Bridge Maintenance
+    or Waterproofing -- without this restriction those unrelated items
+    would be scored and could be selected by mistake.
     """
     if df is None or df.empty:
         return pd.DataFrame()
