@@ -1,33 +1,3 @@
-"""
-SSR Loader for Road Cost Estimator
-
-Designed for Maharashtra PWD SSR 2022-23.
-
-The loader converts the original SSR Excel workbook into a
-standard DataFrame used by app.py.
-
-Required output columns:
-
-    id
-    item_no
-    chapter
-    description
-    unit
-    rate
-    kind
-
-Supported input:
-    - Excel .xlsx
-    - Excel .xls
-    - CSV
-    - Streamlit UploadedFile
-    - file path
-    - bytes
-
-The loader specifically understands the Maharashtra PWD
-"SSR 2022-23" worksheet structure.
-"""
-
 import io
 import os
 import re
@@ -35,1323 +5,411 @@ import re
 import pandas as pd
 
 
-# ============================================================
-# TEXT HELPERS
-# ============================================================
-
-def _clean_text(value):
-    """
-    Convert a cell value into clean readable text.
-    """
-
+def _clean_text(value) -> str:
+    """Convert any cell value into clean, single-spaced text."""
     if value is None:
         return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    text = str(value)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
+
+def _normalise_name(value) -> str:
+    """Normalise a column/sheet/chapter name for tolerant comparison."""
+    text = _clean_text(value).lower()
+    text = text.replace("\n", " ").replace("_", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _prepare_source(source):
+    """Normalise the many possible input types into something pandas can read."""
+    if isinstance(source, (str, os.PathLike)):
+        path = os.fspath(source)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"SSR file not found: {path}")
+        return path
+
+    if hasattr(source, "seek"):
+        try:
+            source.seek(0)
+        except Exception:
+            pass
+        return source
+
+    if isinstance(source, (bytes, bytearray)):
+        return io.BytesIO(source)
+
+    raise TypeError(
+        "Unsupported SSR source. Provide a file path, bytes, "
+        "or a file-like object (e.g. a Streamlit UploadedFile)."
+    )
+
+
+def _source_filename(source) -> str:
+    if isinstance(source, (str, os.PathLike)):
+        return os.fspath(source).lower()
+    if hasattr(source, "name"):
+        return str(source.name).lower()
+    return ""
+
+
+def _find_ssr_sheet(excel_file: pd.ExcelFile) -> str:
+    """Find the worksheet that actually holds the SSR item table."""
+    sheet_names = excel_file.sheet_names
+
+    for sheet in sheet_names:
+        if _normalise_name(sheet) == "ssr 2022-23":
+            return sheet
+
+    for sheet in sheet_names:
+        if "ssr 2022-23" in _normalise_name(sheet):
+            return sheet
+
+    for sheet in sheet_names:
+        normalized = _normalise_name(sheet)
+        if normalized.startswith("ssr") or "schedule of rates" in normalized:
+            return sheet
+
+    raise ValueError(
+        "Could not find the SSR item worksheet in this workbook. "
+        "Expected a sheet named something like 'SSR 2022-23'."
+    )
+
+
+def _find_columns(columns) -> dict:
+    """Map the messy Maharashtra SSR column headers onto our internal names."""
+    mapping = {}
+
+    for column in columns:
+        normalized = _normalise_name(column)
+
+        if "sr" in normalized and "no" in normalized and "item" not in normalized:
+            mapping.setdefault("sr_no", column)
+        elif normalized == "chapter" or ("chapter" in normalized and "chapter" not in mapping):
+            mapping["chapter"] = column
+        elif "ssr item" in normalized or normalized in ("item no", "item no.") or "item number" in normalized:
+            mapping["item_no"] = column
+        elif "description of the item" in normalized or normalized.startswith("description"):
+            mapping.setdefault("description", column)
+        elif normalized == "unit":
+            mapping["unit"] = column
+        elif "completed rate" in normalized and "2022-23" in normalized:
+            mapping["rate"] = column
+        elif "completed rate" in normalized and "rate" not in mapping:
+            mapping.setdefault("rate", column)
+
+    required = ["chapter", "item_no", "description", "unit", "rate"]
+    missing = [field for field in required if field not in mapping]
+    if missing:
+        raise ValueError(
+            "The SSR file is missing required columns: " + ", ".join(missing)
+        )
+
+    return mapping
+
+
+_VOLUME_PATTERNS = ["cubic metre", "cubic meter", "cum", "m3", "m³", "cu.m", "cubic"]
+_AREA_PATTERNS = ["square metre", "square meter", "sq metre", "sq meter", "sq.m", "sqm", "m2", "m²"]
+_LENGTH_PATTERNS = ["running metre", "running meter", "metre", "meter", "mtr"]
+_WEIGHT_PATTERNS = ["kilogram", "kg", "tonne", "ton", "metric ton", "quintal"]
+
+
+def infer_kind(unit: str) -> str:
+    """Classify an SSR unit into a quantity category used by the estimator."""
+    text = _clean_text(unit).lower()
+    if not text:
+        return "unknown"
+
+    if any(p in text for p in _VOLUME_PATTERNS):
+        return "volume"
+    if any(p in text for p in _AREA_PATTERNS):
+        return "area"
+    if "kilometre" in text or "kilometer" in text or text == "km":
+        return "km"
+    if any(p in text for p in _LENGTH_PATTERNS):
+        return "length"
+    if any(p in text for p in _WEIGHT_PATTERNS):
+        return "weight"
+    if "number" in text or "nos" in text or text in ("no", "no.", "each"):
+        return "nos"
+
+    return "unknown"
+
+
+def _load_excel_raw(source) -> pd.DataFrame:
+    prepared = _prepare_source(source)
+
+    try:
+        excel_file = pd.ExcelFile(prepared)
+    except Exception as error:
+        raise ValueError("Unable to open the SSR Excel file.") from error
+
+    sheet_name = _find_ssr_sheet(excel_file)
+
+    try:
+        # header=1: the true column headers are on the second row of this
+        # sheet; the first row only has merged section labels.
+        raw = pd.read_excel(excel_file, sheet_name=sheet_name, usecols="A:I", header=1)
+    except Exception as error:
+        raise ValueError(f"Could not read the SSR worksheet '{sheet_name}'.") from error
+
+    if raw.empty:
+        raise ValueError("The SSR worksheet is empty.")
+
+    raw.columns = [_clean_text(c).lower() for c in raw.columns]
+    column_map = _find_columns(raw.columns)
+
+    cols = ["chapter", "item_no", "description", "unit", "rate"]
+    if "sr_no" in column_map:
+        cols = ["sr_no"] + cols
+
+    data = raw[[column_map[c] for c in cols]].copy()
+    data.columns = cols
+    return data
+
+
+def _load_csv_raw(source) -> pd.DataFrame:
+    prepared = source
+    if isinstance(source, (bytes, bytearray)):
+        prepared = io.BytesIO(source)
+    elif hasattr(source, "seek"):
+        try:
+            source.seek(0)
+        except Exception:
+            pass
+
+    try:
+        raw = pd.read_csv(prepared)
+    except Exception as error:
+        raise ValueError("Unable to read the CSV SSR file.") from error
+
+    if raw.empty:
+        raise ValueError("The uploaded SSR CSV is empty.")
+
+    raw.columns = [_clean_text(c).lower() for c in raw.columns]
+    column_map = _find_columns(raw.columns)
+
+    cols = ["chapter", "item_no", "description", "unit", "rate"]
+    if "sr_no" in column_map:
+        cols = ["sr_no"] + cols
+
+    data = raw[[column_map[c] for c in cols]].copy()
+    data.columns = cols
+    return data
+
+
+def _format_item_no(value) -> str:
+    """
+    Format an SSR item number for display.
+
+    Excel stores plain numeric item numbers (e.g. 53.84) as binary
+    floats, which can print with precision artifacts such as
+    "53.839999999999954". Those are rounded and reformatted cleanly.
+    Lettered item numbers (e.g. "2.29a", or a bare "a"/"b" continuation
+    row) are not numeric and are kept exactly as written.
+    """
+    if value is None:
+        return ""
     try:
         if pd.isna(value):
             return ""
     except Exception:
         pass
 
-    text = str(value)
+    if isinstance(value, (int, float)):
+        return f"{round(float(value), 4):g}"
 
-    # Replace line breaks / tabs / repeated spaces
-    text = re.sub(r"\s+", " ", text)
-
-    return text.strip()
-
-
-def _normalise_name(value):
-    """
-    Normalize a column/sheet name for comparisons.
-    """
-
-    text = _clean_text(value).lower()
-
-    text = text.replace("\n", " ")
-    text = text.replace("_", " ")
-    text = re.sub(r"\s+", " ", text)
-
-    return text.strip()
-
-
-# ============================================================
-# SOURCE HANDLING
-# ============================================================
-
-def _prepare_excel_source(source):
-    """
-    Convert different input types into something pandas can read.
-    """
-
-    # --------------------------------------------------------
-    # File path
-    # --------------------------------------------------------
-
-    if isinstance(source, (str, os.PathLike)):
-
-        path = os.fspath(source)
-
-        if not os.path.exists(path):
-            raise FileNotFoundError(
-                f"SSR file not found: {path}"
-            )
-
-        return path
-
-    # --------------------------------------------------------
-    # Streamlit UploadedFile / file-like object
-    # --------------------------------------------------------
-
-    if hasattr(source, "seek"):
-
-        try:
-            source.seek(0)
-        except Exception:
-            pass
-
-        return source
-
-    # --------------------------------------------------------
-    # Raw bytes
-    # --------------------------------------------------------
-
-    if isinstance(source, (bytes, bytearray)):
-
-        return io.BytesIO(source)
-
-    raise TypeError(
-        "Unsupported SSR source. "
-        "Please provide an Excel file, CSV file, "
-        "file path, bytes, or Streamlit UploadedFile."
-    )
-
-
-# ============================================================
-# FIND SSR WORKSHEET
-# ============================================================
-
-def _find_ssr_sheet(excel_file):
-    """
-    Find the actual Maharashtra PWD SSR worksheet.
-
-    Preferred:
-        SSR 2022-23
-
-    Fallback:
-        Any sheet containing 'SSR 2022-23'
-    """
-
-    sheet_names = excel_file.sheet_names
-
-    # Exact normalized match
-    for sheet in sheet_names:
-
-        if _normalise_name(sheet) == "ssr 2022-23":
-
-            return sheet
-
-    # Partial match
-    for sheet in sheet_names:
-
-        normalized = _normalise_name(sheet)
-
-        if "ssr 2022-23" in normalized:
-
-            return sheet
-
-    # General SSR fallback
-    for sheet in sheet_names:
-
-        normalized = _normalise_name(sheet)
-
-        if (
-            "state schedule of rates" in normalized
-            or normalized.startswith("ssr")
-        ):
-
-            return sheet
-
-    raise ValueError(
-        "The Maharashtra PWD SSR worksheet "
-        "'SSR 2022-23' could not be found."
-    )
-
-
-# ============================================================
-# FIND COLUMNS
-# ============================================================
-
-def _find_columns(columns):
-    """
-    Detect the important SSR columns.
-
-    The actual Maharashtra SSR workbook contains:
-
-        Sr. No.
-        Chapter
-        SSR Item No.
-        Reference No.
-        Description of the item
-        Additional Specification
-        Unit
-        Completed Rate for 2022-23 excluding GST In Rs.
-        Labour Rate...
-
-    Only the required columns are extracted.
-    """
-
-    mapping = {}
-
-    for column in columns:
-
-        normalized = _normalise_name(column)
-
-        # Sr. No.
-        if (
-            "sr" in normalized
-            and "no" in normalized
-            and "item" not in normalized
-        ):
-            mapping.setdefault(
-                "sr_no",
-                column
-            )
-
-        # Chapter
-        elif normalized == "chapter":
-            mapping["chapter"] = column
-
-        elif "chapter" in normalized:
-            mapping.setdefault(
-                "chapter",
-                column
-            )
-
-        # SSR Item Number
-        elif (
-            "ssr item" in normalized
-            or normalized == "item no"
-            or "item number" in normalized
-        ):
-            mapping["item_no"] = column
-
-        # Description
-        elif (
-            "description of the item" in normalized
-            or normalized == "description"
-            or normalized.startswith("description ")
-        ):
-            mapping.setdefault(
-                "description",
-                column
-            )
-
-        # Unit
-        elif normalized == "unit":
-            mapping["unit"] = column
-
-        elif "unit" == normalized.strip():
-            mapping.setdefault(
-                "unit",
-                column
-            )
-
-        # Completed SSR Rate
-        elif (
-            "completed rate" in normalized
-            and "2022-23" in normalized
-        ):
-            mapping["rate"] = column
-
-        elif (
-            "completed rate" in normalized
-            and "rate" not in mapping
-        ):
-            mapping.setdefault(
-                "rate",
-                column
-            )
-
-    required = [
-        "sr_no",
-        "chapter",
-        "item_no",
-        "description",
-        "unit",
-        "rate"
-    ]
-
-    missing = [
-        field
-        for field in required
-        if field not in mapping
-    ]
-
-    if missing:
-
-        raise ValueError(
-            "The SSR workbook is missing required columns: "
-            + ", ".join(missing)
-        )
-
-    return mapping
-
-
-# ============================================================
-# INFER QUANTITY KIND
-# ============================================================
-
-def _infer_kind(unit, description=""):
-    """
-    Determine how the estimator should calculate a default quantity.
-
-    Possible values:
-
-        area
-        volume
-        length
-        km
-        number
-
-    This is only a quantity-type helper.
-    It does NOT decide engineering quantities.
-    """
-
-    unit_text = _clean_text(unit).lower()
-
-    description_text = _clean_text(
-        description
-    ).lower()
-
-    # --------------------------------------------------------
-    # Volume
-    # --------------------------------------------------------
-
-    volume_patterns = [
-        "cubic metre",
-        "cubic meter",
-        "cubic m",
-        "cum",
-        "m3",
-        "m³",
-        "cu.m",
-        "cubic"
-    ]
-
-    if any(
-        pattern in unit_text
-        for pattern in volume_patterns
-    ):
-
-        return "volume"
-
-    # --------------------------------------------------------
-    # Area
-    # --------------------------------------------------------
-
-    area_patterns = [
-        "square metre",
-        "square meter",
-        "square m",
-        "sq metre",
-        "sq meter",
-        "sq.m",
-        "sqm",
-        "m2",
-        "m²",
-        "acre"
-    ]
-
-    if any(
-        pattern in unit_text
-        for pattern in area_patterns
-    ):
-
-        return "area"
-
-    # --------------------------------------------------------
-    # Kilometre
-    # --------------------------------------------------------
-
-    if (
-        "kilometre" in unit_text
-        or "kilometer" in unit_text
-        or "km" == unit_text
-        or "one kilometre" in unit_text
-        or "running one kilometre" in unit_text
-    ):
-
-        return "km"
-
-    # --------------------------------------------------------
-    # Length
-    # --------------------------------------------------------
-
-    length_patterns = [
-        "running metre",
-        "running meter",
-        "one running metre",
-        "one running meter",
-        "running one meter",
-        "running one metre",
-        "metre",
-        "meter",
-        "metre",
-        "mtr"
-    ]
-
-    if any(
-        pattern in unit_text
-        for pattern in length_patterns
-    ):
-
-        return "length"
-
-    # --------------------------------------------------------
-    # Description fallback
-    # --------------------------------------------------------
-
-    if (
-        "length" in description_text
-        and "road" in description_text
-    ):
-
-        return "length"
-
-    # --------------------------------------------------------
-    # Everything else
-    # --------------------------------------------------------
-
-    return "number"
-
-
-# ============================================================
-# LOAD EXCEL SSR
-# ============================================================
-
-def _load_excel(source):
-    """
-    Read the actual Maharashtra PWD SSR workbook.
-    """
-
-    prepared_source = _prepare_excel_source(
-        source
-    )
-
+    text = _clean_text(value)
     try:
-
-        excel_file = pd.ExcelFile(
-            prepared_source
-        )
-
-    except Exception as error:
-
-        raise ValueError(
-            "Unable to open the SSR Excel file. "
-            "Please upload a valid .xlsx or .xls file."
-        ) from error
-
-    # --------------------------------------------------------
-    # Find SSR worksheet
-    # --------------------------------------------------------
-
-    sheet_name = _find_ssr_sheet(
-        excel_file
-    )
-
-    # --------------------------------------------------------
-    # Read only columns A:I.
-    #
-    # The workbook contains a very large formatted sheet.
-    # Reading only the actual SSR columns avoids unnecessary
-    # memory usage.
-    # --------------------------------------------------------
-
-    try:
-
-        raw = pd.read_excel(
-            excel_file,
-            sheet_name=sheet_name,
-            usecols="A:I",
-            header=1
-        )
-
-    except Exception as error:
-
-        raise ValueError(
-            f"Could not read the SSR worksheet '{sheet_name}'."
-        ) from error
-
-    if raw.empty:
-
-        raise ValueError(
-            "The SSR worksheet is empty."
-        )
-
-    # --------------------------------------------------------
-    # Clean column names
-    # --------------------------------------------------------
-
-    raw.columns = [
-        _clean_text(column).lower()
-        for column in raw.columns
-    ]
-
-    # --------------------------------------------------------
-    # Detect columns
-    # --------------------------------------------------------
-
-    column_map = _find_columns(
-        raw.columns
-    )
-
-    # --------------------------------------------------------
-    # Select only required columns
-    # --------------------------------------------------------
-
-    data = raw[
-        [
-            column_map["sr_no"],
-            column_map["chapter"],
-            column_map["item_no"],
-            column_map["description"],
-            column_map["unit"],
-            column_map["rate"]
-        ]
-    ].copy()
-
-    data.columns = [
-        "sr_no",
-        "chapter",
-        "item_no",
-        "description",
-        "unit",
-        "rate"
-    ]
-
-    return data
+        numeric = float(text)
+        return f"{round(numeric, 4):g}"
+    except (TypeError, ValueError):
+        return text
 
 
-# ============================================================
-# LOAD CSV SSR
-# ============================================================
-
-def _load_csv(source):
-    """
-    Load an SSR CSV file.
-    """
-
-    prepared_source = source
-
-    if isinstance(
-        source,
-        (bytes, bytearray)
-    ):
-
-        prepared_source = io.BytesIO(
-            source
-        )
-
-    try:
-
-        # First try normal header
-        raw = pd.read_csv(
-            prepared_source
-        )
-
-    except Exception as error:
-
-        raise ValueError(
-            "Unable to read the CSV SSR file."
-        ) from error
-
-    if raw.empty:
-
-        raise ValueError(
-            "The uploaded SSR CSV is empty."
-        )
-
-    raw.columns = [
-        _clean_text(column).lower()
-        for column in raw.columns
-    ]
-
-    column_map = _find_columns(
-        raw.columns
-    )
-
-    data = raw[
-        [
-            column_map["sr_no"],
-            column_map["chapter"],
-            column_map["item_no"],
-            column_map["description"],
-            column_map["unit"],
-            column_map["rate"]
-        ]
-    ].copy()
-
-    data.columns = [
-        "sr_no",
-        "chapter",
-        "item_no",
-        "description",
-        "unit",
-        "rate"
-    ]
-
-    return data
-
-
-# ============================================================
-# NORMALIZE SSR DATA
-# ============================================================
-
-def _normalise_ssr(raw):
-    """
-    Convert raw SSR data into the DataFrame expected by app.py.
-    """
-
+def _normalise(raw: pd.DataFrame) -> pd.DataFrame:
     data = raw.copy()
 
-    # --------------------------------------------------------
-    # Clean text columns
-    # --------------------------------------------------------
+    # item_no needs its own formatting (see _format_item_no) so it is
+    # handled separately from the other text columns below.
+    data["item_no"] = raw["item_no"].map(_format_item_no)
 
-    for column in [
-        "chapter",
-        "description",
-        "unit"
-    ]:
+    for column in ("chapter", "description", "unit"):
+        data[column] = data[column].map(_clean_text)
 
-        data[column] = data[column].map(
-            _clean_text
-        )
-
-    # --------------------------------------------------------
-    # Forward-fill chapters
+    # Forward-fill the chapter column.
     #
-    # In the Maharashtra SSR:
-    #
-    # Row 3:
-    #   Road Survey and DPR
-    #
-    # Following rows contain item numbers while the chapter
-    # cell may be blank.
-    #
-    # Therefore the current chapter is carried forward.
-    # --------------------------------------------------------
-
+    # In the source workbook a chapter name is only written on the first
+    # row of that chapter; every following item row leaves the chapter
+    # cell blank. We carry the last seen chapter name forward.
     current_chapter = ""
-
-    chapters = []
-
-    for _, row in data.iterrows():
-
-        chapter = _clean_text(
-            row["chapter"]
-        )
-
+    filled_chapters = []
+    for chapter in data["chapter"]:
         if chapter:
-
             current_chapter = chapter
+        filled_chapters.append(current_chapter)
+    data["chapter"] = filled_chapters
 
-        chapters.append(
-            current_chapter
-        )
+    data["rate"] = pd.to_numeric(data["rate"], errors="coerce")
 
-    data["chapter"] = chapters
-
-    # --------------------------------------------------------
-    # Numeric conversions
-    # --------------------------------------------------------
-
-    data["sr_no_numeric"] = pd.to_numeric(
-        data["sr_no"],
-        errors="coerce"
+    # A row is a usable SSR item if it has a description, a unit and a
+    # numeric rate. We deliberately do NOT require item_no to be a pure
+    # number: many genuine items use letter-suffixed numbers such as
+    # "2.29a" or a bare "a"/"b" continuation row, and rejecting those
+    # silently drops real, priced items from the schedule.
+    valid = (
+        data["item_no"].ne("")
+        & data["description"].ne("")
+        & data["unit"].ne("")
+        & data["rate"].notna()
     )
-
-    data["item_no_numeric"] = pd.to_numeric(
-        data["item_no"],
-        errors="coerce"
-    )
-
-    data["rate"] = pd.to_numeric(
-        data["rate"],
-        errors="coerce"
-    )
-
-    # --------------------------------------------------------
-    # Keep actual SSR item rows only
-    #
-    # Chapter title rows have no SSR item number.
-    # --------------------------------------------------------
-
-    valid_rows = (
-        data["item_no_numeric"].notna()
-        &
-        data["description"].ne("")
-        &
-        data["unit"].ne("")
-        &
-        data["rate"].notna()
-    )
-
-    data = data.loc[
-        valid_rows
-    ].copy()
+    data = data.loc[valid].copy()
 
     if data.empty:
+        raise ValueError("No valid SSR items were found in this file.")
 
-        raise ValueError(
-            "No valid SSR items were found in the workbook."
-        )
+    data["kind"] = data["unit"].map(infer_kind)
 
-    # --------------------------------------------------------
-    # Clean item numbers
-    #
-    # Example:
-    #
-    # 1.01 -> "1.01"
-    # 1.1  -> "1.1"
-    # --------------------------------------------------------
+    data.reset_index(drop=True, inplace=True)
+    data.insert(0, "id", range(len(data)))
 
-    data["item_no"] = data[
-        "item_no_numeric"
-    ].map(
-        lambda value: (
-            f"{value:g}"
-            if pd.notna(value)
-            else ""
-        )
-    )
-
-    # --------------------------------------------------------
-    # Make rate numeric
-    # --------------------------------------------------------
-
-    data["rate"] = pd.to_numeric(
-        data["rate"],
-        errors="coerce"
-    )
-
-    # --------------------------------------------------------
-    # Infer quantity kind
-    # --------------------------------------------------------
-
-    data["kind"] = [
-        _infer_kind(
-            unit,
-            description
-        )
-        for unit, description
-        in zip(
-            data["unit"],
-            data["description"]
-        )
-    ]
-
-    # --------------------------------------------------------
-    # Create internal ID
-    #
-    # app.py uses this as the DataFrame index.
-    # --------------------------------------------------------
-
-    data.reset_index(
-        drop=True,
-        inplace=True
-    )
-
-    data.insert(
-        0,
-        "id",
-        range(
-            len(data)
-        )
-    )
-
-    # --------------------------------------------------------
-    # Final column order
-    # --------------------------------------------------------
-
-    result = data[
-        [
-            "id",
-            "item_no",
-            "chapter",
-            "description",
-            "unit",
-            "rate",
-            "kind"
-        ]
-    ].copy()
-
-    # --------------------------------------------------------
-    # Final cleanup
-    # --------------------------------------------------------
-
-    result["chapter"] = result[
-        "chapter"
-    ].map(_clean_text)
-
-    result["description"] = result[
-        "description"
-    ].map(_clean_text)
-
-    result["unit"] = result[
-        "unit"
-    ].map(_clean_text)
-
-    result["rate"] = pd.to_numeric(
-        result["rate"],
-        errors="coerce"
-    )
-
-    result = result[
-        result["rate"].notna()
-    ].copy()
-
-    result.reset_index(
-        drop=True,
-        inplace=True
-    )
-
-    # Re-create IDs after final filtering
-    result["id"] = range(
-        len(result)
-    )
+    result = data[["id", "item_no", "chapter", "description", "unit", "rate", "kind"]].copy()
+    result = result.drop_duplicates(subset=["item_no", "description", "unit", "rate"], keep="first")
+    result.reset_index(drop=True, inplace=True)
+    result["id"] = range(len(result))
 
     return result
 
 
-# ============================================================
-# PUBLIC LOAD FUNCTION
-# ============================================================
-
-def load_ssr(source):
+def load_ssr(source) -> pd.DataFrame:
     """
-    Main SSR loading function used by app.py.
+    Load an SSR file (Excel .xlsx/.xls or CSV) into the standard DataFrame.
 
-    Example:
-
-        df = load_ssr(uploaded_file)
-
-    or:
-
-        df = load_ssr("SSR_2022-23 (2).xlsx")
+    Accepts: a file path, raw bytes, or a file-like object such as a
+    Streamlit UploadedFile.
     """
-
     if source is None:
+        raise ValueError("No SSR file was provided.")
 
-        raise ValueError(
-            "No SSR file was provided."
-        )
+    filename = _source_filename(source)
 
-    # --------------------------------------------------------
-    # Detect file extension
-    # --------------------------------------------------------
-
-    filename = ""
-
-    if isinstance(
-        source,
-        (str, os.PathLike)
-    ):
-
-        filename = os.fspath(
-            source
-        )
-
-    elif hasattr(
-        source,
-        "name"
-    ):
-
-        filename = str(
-            source.name
-        )
-
-    filename = filename.lower()
-
-    # --------------------------------------------------------
-    # CSV
-    # --------------------------------------------------------
-
-    if filename.endswith(
-        ".csv"
-    ):
-
-        raw = _load_csv(
-            source
-        )
-
-    # --------------------------------------------------------
-    # Excel
-    # --------------------------------------------------------
-
+    if filename.endswith(".csv"):
+        raw = _load_csv_raw(source)
     else:
+        # .xlsx and .xls both go through pandas' Excel reader. Reading a
+        # legacy .xls file requires the 'xlrd' package to be installed.
+        raw = _load_excel_raw(source)
 
-        raw = _load_excel(
-            source
-        )
+    result = _normalise(raw)
 
-    # --------------------------------------------------------
-    # Normalize
-    # --------------------------------------------------------
-
-    result = _normalise_ssr(
-        raw
-    )
-
-    # --------------------------------------------------------
-    # Safety check
-    # --------------------------------------------------------
-
-    required_columns = [
-        "id",
-        "item_no",
-        "chapter",
-        "description",
-        "unit",
-        "rate",
-        "kind"
-    ]
-
-    missing = [
-        column
-        for column in required_columns
-        if column not in result.columns
-    ]
-
+    required = ["id", "item_no", "chapter", "description", "unit", "rate", "kind"]
+    missing = [c for c in required if c not in result.columns]
     if missing:
-
-        raise ValueError(
-            "SSR loader failed to create required columns: "
-            + ", ".join(missing)
-        )
-
-    if result.empty:
-
-        raise ValueError(
-            "SSR contains no usable items."
-        )
+        raise ValueError("SSR loader failed to produce required columns: " + ", ".join(missing))
 
     return result
 
 
-# ============================================================
-# CHAPTER MATCHING
-# ============================================================
+def ssr_health_summary(df: pd.DataFrame) -> dict:
+    """A small diagnostic summary, shown right after loading an SSR file
+    so a broken/changed file format is caught immediately."""
+    return {
+        "total_items": int(len(df)),
+        "total_chapters": int(df["chapter"].nunique()),
+        "items_by_kind": df["kind"].value_counts().to_dict(),
+        "unknown_unit_items": int((df["kind"] == "unknown").sum()),
+        "lettered_item_numbers": int(df["item_no"].str.contains(r"[a-zA-Z]", regex=True).sum()),
+    }
 
-def match_chapters(
-    available_chapters,
-    wanted_chapters
-):
-    """
-    Match requested chapter names against the actual
-    chapter names in the SSR.
 
-    This is tolerant of:
-        - capitalization
-        - extra spaces
-        - line breaks
-        - small spelling differences
-
-    Example:
-
-        match_chapters(
-            all_chapters,
-            ["Road Sub grade"]
-        )
-    """
-
-    if not available_chapters:
+def match_chapters(available_chapters, wanted_chapters) -> list:
+    """Map 'wanted' chapter names onto the actual chapter names present
+    in the loaded SSR, tolerating case/spacing/spelling differences."""
+    if not available_chapters or not wanted_chapters:
         return []
 
-    if not wanted_chapters:
-        return []
-
+    normalized_available = [(str(c), _normalise_name(c)) for c in available_chapters]
     result = []
 
-    normalized_available = []
-
-    for chapter in available_chapters:
-
-        clean = _clean_text(
-            chapter
-        )
-
-        normalized_available.append(
-            (
-                clean,
-                _normalise_name(
-                    clean
-                )
-            )
-        )
-
     for wanted in wanted_chapters:
-
-        wanted_clean = _clean_text(
-            wanted
-        )
-
-        if not wanted_clean:
+        wanted_norm = _normalise_name(wanted)
+        if not wanted_norm:
             continue
 
-        wanted_normalized = _normalise_name(
-            wanted_clean
-        )
+        for actual, norm in normalized_available:
+            if norm == wanted_norm and actual not in result:
+                result.append(actual)
 
-        # ----------------------------------------------------
-        # Exact match
-        # ----------------------------------------------------
-
-        for actual, normalized in normalized_available:
-
-            if normalized == wanted_normalized:
-
-                if actual not in result:
+        if not any(_normalise_name(r) == wanted_norm for r in result):
+            for actual, norm in normalized_available:
+                if (wanted_norm in norm or norm in wanted_norm) and actual not in result:
                     result.append(actual)
-
-        # ----------------------------------------------------
-        # Substring match
-        # ----------------------------------------------------
-
-        if not any(
-            _normalise_name(item)
-            == wanted_normalized
-            for item in result
-        ):
-
-            for actual, normalized in normalized_available:
-
-                if (
-                    wanted_normalized in normalized
-                    or normalized in wanted_normalized
-                ):
-
-                    if actual not in result:
-                        result.append(actual)
 
     return result
 
 
-# ============================================================
-# SSR ITEM SEARCH
-# ============================================================
-
-def search(
-    df,
-    chapters=None,
-    keywords=None
-):
-    """
-    Search SSR items.
-
-    Parameters
-    ----------
-    df:
-        SSR DataFrame returned by load_ssr()
-
-    chapters:
-        List of chapter names.
-
-    keywords:
-        List of search keywords.
-
-    Returns
-    -------
-    DataFrame
-    """
-
+def search(df: pd.DataFrame, chapters=None, keywords=None) -> pd.DataFrame:
+    """Filter the SSR DataFrame by chapter and by keywords (all keywords
+    must appear somewhere in item number/chapter/description/unit)."""
     if df is None:
-
         return pd.DataFrame()
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError("search() expects a pandas DataFrame.")
 
-    if not isinstance(
-        df,
-        pd.DataFrame
-    ):
-
-        raise TypeError(
-            "SSR search expects a pandas DataFrame."
-        )
-
-    result = df.copy()
-
-    # --------------------------------------------------------
-    # Chapter filtering
-    # --------------------------------------------------------
+    result = df
 
     if chapters:
+        wanted = {_normalise_name(c) for c in chapters if _clean_text(c)}
+        if wanted:
+            mask = result["chapter"].map(_normalise_name).isin(wanted)
+            result = result[mask]
 
-        normalized_chapters = {
-            _normalise_name(
-                chapter
-            )
-            for chapter in chapters
-            if _clean_text(chapter)
-        }
-
-        if normalized_chapters:
-
-            chapter_mask = result[
-                "chapter"
-            ].map(
-                _normalise_name
-            ).isin(
-                normalized_chapters
-            )
-
-            result = result[
-                chapter_mask
-            ]
-
-    # --------------------------------------------------------
-    # Keyword filtering
-    # --------------------------------------------------------
-
-    clean_keywords = []
-
-    for keyword in (
-        keywords or []
-    ):
-
-        keyword = _clean_text(
-            keyword
-        )
-
-        if keyword:
-
-            clean_keywords.append(
-                keyword.lower()
-            )
-
+    clean_keywords = [_clean_text(k).lower() for k in (keywords or []) if _clean_text(k)]
     if clean_keywords:
-
-        # Search across item number, chapter,
-        # description and unit.
-
         searchable = (
-            result["item_no"].astype(str)
-            + " "
-            + result["chapter"].astype(str)
-            + " "
-            + result["description"].astype(str)
-            + " "
+            result["item_no"].astype(str) + " "
+            + result["chapter"].astype(str) + " "
+            + result["description"].astype(str) + " "
             + result["unit"].astype(str)
         ).str.lower()
 
-        # Every keyword must occur somewhere
-        # in the searchable item text.
-
-        mask = pd.Series(
-            True,
-            index=result.index
-        )
-
+        mask = pd.Series(True, index=result.index)
         for keyword in clean_keywords:
+            mask &= searchable.str.contains(re.escape(keyword), na=False)
+        result = result[mask]
 
-            mask &= searchable.str.contains(
-                re.escape(keyword),
-                na=False
-            )
-
-        result = result[
-            mask
-        ]
-
-    # --------------------------------------------------------
-    # Reset index
-    # --------------------------------------------------------
-
-    result = result.reset_index(
-        drop=True
-    )
-
-    return result
+    return result.reset_index(drop=True)
 
 
-# ============================================================
-# AI-FRIENDLY SSR SEARCH
-# ============================================================
-
-def search_keywords(
-    df,
-    keywords,
-    chapters=None
-):
-    """
-    Convenience wrapper for AI-generated SSR keywords.
-
-    Example:
-
-        search_keywords(
-            df,
-            [
-                "concrete pavement",
-                "cement concrete",
-                "PCC"
-            ],
-            ["Rigid Pavement"]
-        )
-    """
-
-    return search(
-        df=df,
-        chapters=chapters,
-        keywords=keywords
-    )
-
-
-# ============================================================
-# GET SSR ITEM BY ID
-# ============================================================
-
-def get_item(
-    df,
-    item_id
-):
-    """
-    Safely retrieve one SSR item by internal ID.
-    """
-
+def get_item(df: pd.DataFrame, item_id):
+    """Safely fetch a single SSR row by its internal id."""
     if df is None or df.empty:
-
         return None
-
     try:
-
-        item_id = int(
-            item_id
-        )
-
-    except (
-        TypeError,
-        ValueError
-    ):
-
+        item_id = int(item_id)
+    except (TypeError, ValueError):
         return None
+    matches = df[df["id"] == item_id]
+    return None if matches.empty else matches.iloc[0]
 
-    matches = df[
-        df["id"] == item_id
-    ]
-
-    if matches.empty:
-
-        return None
-
-    return matches.iloc[0]
-
-
-# ============================================================
-# GET ITEMS BY CHAPTER
-# ============================================================
-
-def get_chapter_items(
-    df,
-    chapter
-):
-    """
-    Return all SSR items belonging to a chapter.
-    """
-
-    if df is None or df.empty:
-
-        return pd.DataFrame()
-
-    target = _normalise_name(
-        chapter
-    )
-
-    mask = (
-        df["chapter"]
-        .map(_normalise_name)
-        == target
-    )
-
-    return df[
-        mask
-    ].reset_index(
-        drop=True
-    )
-
-
-# ============================================================
-# MODULE TEST
-# ============================================================
 
 if __name__ == "__main__":
+    import sys
 
-    default_file = (
-        "SSR_2022-23 (2).xlsx"
-    )
+    test_file = sys.argv[1] if len(sys.argv) > 1 else "SSR_2022-23 (2).xlsx"
 
-    if os.path.exists(
-        default_file
-    ):
-
-        try:
-
-            dataframe = load_ssr(
-                default_file
-            )
-
-            print(
-                "SSR loaded successfully."
-            )
-
-            print(
-                f"Total usable items: "
-                f"{len(dataframe)}"
-            )
-
-            print(
-                "\nColumns:"
-            )
-
-            print(
-                list(
-                    dataframe.columns
-                )
-            )
-
-            print(
-                "\nFirst 5 items:"
-            )
-
-            print(
-                dataframe.head()
-            )
-
-            print(
-                "\nChapters:"
-            )
-
-            print(
-                dataframe[
-                    "chapter"
-                ].nunique()
-            )
-
-        except Exception as error:
-
-            print(
-                "SSR loading failed:"
-            )
-
-            print(
-                error
-            )
-
+    if not os.path.exists(test_file):
+        print(f"Test file not found: {test_file}")
     else:
-
-        print(
-            "Test file not found:"
-        )
-
-        print(
-            default_file
-        )
+        try:
+            df = load_ssr(test_file)
+            print("SSR loaded successfully.")
+            print(ssr_health_summary(df))
+        except Exception as error:
+            print("SSR loading failed:", error)
