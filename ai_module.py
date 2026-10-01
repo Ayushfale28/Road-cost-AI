@@ -176,10 +176,17 @@ def _call_model(model: str, messages, system_prompt: str, temperature: float, js
         except Exception:
             error_body = ""
         print(f"OpenRouter HTTP error ({model}):", error.code, error_body[:800])
-        raise RuntimeError("AI request failed.") from error
+        # The code itself (401/404/429/...) is not sensitive -- it is the
+        # single most useful signal for diagnosing a misconfigured key,
+        # an invalid/retired model slug, or a rate limit, without
+        # exposing the key or naming the provider to the end user.
+        raise RuntimeError(f"AI request failed (HTTP {error.code}).") from error
+    except urllib.error.URLError as error:
+        print(f"OpenRouter connection error ({model}):", repr(error))
+        raise RuntimeError("AI request failed (network/timeout).") from error
     except Exception as error:
         print(f"OpenRouter connection error ({model}):", repr(error))
-        raise RuntimeError("AI request failed.") from error
+        raise RuntimeError("AI request failed (unexpected error).") from error
 
     try:
         data = json.loads(raw)
@@ -272,9 +279,13 @@ def analyze_photo(image_bytes: bytes, mime_type: str, note: str = "") -> dict:
     return parse_json_response(text)
 
 
-def _unavailable_result(reason: str) -> dict:
+def _unavailable_result(reason: str, debug_detail: str = "") -> dict:
     """A result with the exact schema analyze_photo produces on success,
-    so the UI never has to special-case a failure shape."""
+    so the UI never has to special-case a failure shape. debug_detail is
+    a sanitized, non-sensitive error signal (e.g. an HTTP status code)
+    meant only for the developer -- the app only shows it behind an
+    explicit "show technical details" toggle, never to end users by
+    default, and it never contains the API key or provider/model name."""
     return {
         "photo_quality": {"value": "poor", "reason": "analysis unavailable"},
         "site_type": {"value": "unclear", "confidence": "low"},
@@ -291,6 +302,7 @@ def _unavailable_result(reason: str) -> dict:
         "suggested_works": [],
         "suggested_parameters": [],
         "limitations": "Automatic photo analysis was unavailable. Manual site review is required.",
+        "_debug_detail": debug_detail,
     }
 
 
@@ -307,7 +319,7 @@ def analyze_photos(photos: list, note: str = "") -> list:
             result = analyze_photo(photo.get("bytes"), photo.get("mime", "image/jpeg"), note)
         except Exception as error:
             print(f"Photo analysis failed for {name}:", repr(error))
-            result = _unavailable_result("Photo could not be automatically analysed.")
+            result = _unavailable_result("Photo could not be automatically analysed.", str(error))
         results.append({"name": name, "result": result})
     return results
 
