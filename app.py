@@ -201,6 +201,14 @@ with st.sidebar:
     else:
         st.info("Default SSR will be used.")
 
+    st.divider()
+    show_debug = st.checkbox(
+        "Show technical details (debugging)", value=False,
+        help="Shows a sanitized error signal (e.g. an HTTP status code) when "
+             "AI analysis fails, to help diagnose configuration issues. "
+             "Never shows the API key or which AI provider is used.",
+    )
+
 
 @st.cache_data(show_spinner="Loading SSR...")
 def get_ssr(file_source):
@@ -297,6 +305,9 @@ if st.session_state.ai_results:
             limitations = result.get("limitations")
             if limitations:
                 st.caption(f"Limitations: {limitations}")
+
+            if show_debug and result.get("_debug_detail"):
+                st.caption(f"Debug: {result['_debug_detail']}")
 
 ai = st.session_state.ai
 if ai:
