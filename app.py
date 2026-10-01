@@ -18,10 +18,6 @@ st.set_page_config(page_title="Road Estimator - AI Assisted", layout="wide")
 st.title("Road Estimator - AI Assisted Estimation")
 
 
-# ============================================================
-# SSR CHAPTER GROUPS
-# ============================================================
-
 COMMON_NEW = [
     "Road Survey and DPR", "Excavation", "Road Sub grade",
     "Road Sub Base and Base Course", "Cross Drainage Works",
@@ -39,17 +35,13 @@ DEFAULT_SSR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SSR
 REQUIRED_COLUMNS = ["id", "item_no", "chapter", "description", "unit", "rate", "kind"]
 
 
-# ============================================================
-# SESSION STATE
-# ============================================================
-
 DEFAULTS = {
     "ai": None,
     "ai_results": [],
     "photos": [],
     "photo": None,
     "photo_mime": "image/jpeg",
-    "selected": {},          # item id -> quantity
+    "selected": {},
     "chat": [],
 }
 for key, value in DEFAULTS.items():
@@ -57,10 +49,6 @@ for key, value in DEFAULTS.items():
         st.session_state[key] = list(value) if isinstance(value, list) else \
             (dict(value) if isinstance(value, dict) else value)
 
-
-# ============================================================
-# SMALL HELPERS
-# ============================================================
 
 def safe_float(value, default=0.0) -> float:
     try:
@@ -92,9 +80,7 @@ def ai_confidence(field, default="-"):
 
 
 def ai_text(field, default="-"):
-    """Like ai_value, but always returns a plain string (for free-text fields
-    such as photo_quality, which some prompt versions return as a dict with
-    a 'reason', and others may return as a plain string)."""
+    """Like ai_value, but always returns a plain string."""
     if isinstance(field, dict):
         value = field.get("value", "")
         reason = field.get("reason", "")
@@ -177,10 +163,6 @@ def normalize_ssr_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ============================================================
-# SIDEBAR
-# ============================================================
-
 with st.sidebar:
     st.header("Project Setup")
     st.caption("AI features are configured automatically by the application.")
@@ -192,8 +174,7 @@ with st.sidebar:
     st.caption("Upload an SSR (Excel or CSV) if you want to use a different "
                "schedule. Otherwise the default SSR is used.")
     # Only formats the loader can actually read are offered here -- PDF/DOCX/
-    # TXT are not accepted because there is no real parser for them yet, and
-    # advertising a format that silently fails is worse than not offering it.
+    # TXT are not accepted because there is no real parser for them yet.
     ssr_file = st.file_uploader("Upload SSR", type=["xlsx", "xls", "csv"])
 
     if ssr_file is not None:
@@ -229,10 +210,6 @@ def load_selected_ssr():
         st.stop()
 
 
-# ============================================================
-# 1. SITE PHOTOS
-# ============================================================
-
 st.subheader("1. Site Photos")
 st.caption("Upload one or more photos of the road/site -- an existing road, "
            "a damaged road, a kaccha track, or open land where a road is planned.")
@@ -262,7 +239,7 @@ if photos:
         with st.spinner("Analyzing photo(s)..."):
             st.session_state.ai_results = analyze_photos(st.session_state.photos, note)
         st.session_state.ai = combine_ai_results(st.session_state.ai_results)
-        st.session_state.selected = {}  # a new site analysis starts a fresh estimate
+        st.session_state.selected = {}
         st.success("Site analysis completed.")
 
 if st.session_state.ai_results:
@@ -306,16 +283,8 @@ if ai:
     c2.metric("Detected Road Type", str(ai_value(ai.get("road_type"))))
 
 
-# ============================================================
-# TABS
-# ============================================================
-
 estimate_tab, chat_tab = st.tabs(["Estimate", "Chat Assistant"])
 
-
-# ============================================================
-# CHAT TAB
-# ============================================================
 
 with chat_tab:
     st.subheader("Road Project Chat Assistant")
@@ -344,10 +313,6 @@ with chat_tab:
         st.rerun()
 
 
-# ============================================================
-# ESTIMATE TAB
-# ============================================================
-
 with estimate_tab:
     df = load_selected_ssr()
 
@@ -356,7 +321,6 @@ with estimate_tab:
 
     all_chapters = sorted(c for c in df["chapter"].unique() if c)
 
-    # -------------------- Work type --------------------
     st.subheader("2. Select Work Type")
     modes = ["Repair (Existing Road)", "New Road Construction"]
     ai_mode = ai_value(ai.get("recommended_mode"), None) if ai else None
@@ -377,7 +341,6 @@ with estimate_tab:
 
     preset_chapters = match_chapters(all_chapters, wanted_chapters)
 
-    # -------------------- Measurements --------------------
     st.subheader("4. Project Measurements")
     m1, m2, m3, m4 = st.columns(4)
     length = m1.number_input("Length (m)", min_value=0.0, value=0.0, step=1.0)
@@ -385,8 +348,6 @@ with estimate_tab:
     thickness = m3.number_input("Thickness (mm)", min_value=0.0, value=0.0, step=5.0)
     gst = m4.number_input("GST (%)", min_value=0.0, value=18.0, step=1.0)
 
-    # These extra fields only matter for repair-type work, so they are
-    # shown only in that mode rather than always cluttering the form.
     pothole_count = pothole_len = pothole_wid = pothole_depth = 0.0
     drainage_length = 0.0
     if mode == "Repair (Existing Road)":
@@ -414,7 +375,6 @@ with estimate_tab:
         traffic_type=traffic_type, soil_condition=soil_condition,
     )
 
-    # -------------------- Automatic estimation --------------------
     st.subheader("5. Automatic SSR Estimation")
     st.caption("The system searches the real SSR file for relevant items, then "
                "(if AI is available) asks it to pick the relevant subset. The "
@@ -451,8 +411,6 @@ with estimate_tab:
                         selected_ids = ai_pick["selected_ids"]
                         selection_reasons = ai_pick["reasons"]
                 except Exception:
-                    # AI refinement failed -- fall back to the top keyword
-                    # candidates found above, so the feature still works.
                     pass
 
             st.session_state.selected = {}
@@ -464,11 +422,10 @@ with estimate_tab:
             st.success(f"{len(selected_ids)} SSR item(s) were proposed. Review them below "
                        f"-- items showing 0 quantity need a manual value.")
 
-    # -------------------- Manual SSR search (always available) --------------------
     st.subheader("6. Add Additional SSR Items Manually")
     chapters = st.multiselect(
         "SSR Chapters", all_chapters, default=preset_chapters,
-        key=f"manual_chapters_{mode}_{road_kind}",  # changes when mode/road type changes
+        key=f"manual_chapters_{mode}_{road_kind}",
     )
     keywords_text = st.text_input(
         "Search SSR items", placeholder="Example: excavation, concrete, bitumen, pothole, drain",
@@ -497,7 +454,6 @@ with estimate_tab:
                     added += 1
             st.success(f"{added} item(s) added." if added else "No new items were added.")
 
-    # -------------------- Cost estimate --------------------
     st.subheader("7. Cost Estimate")
 
     if not st.session_state.selected:
